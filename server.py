@@ -7,7 +7,7 @@ from tools.swmm_tools import simulate_new
 
 app = FastAPI()
 
-# Allow local frontend + railway domain
+# Allow local frontend + production Vercel domains
 origins = [
     "http://localhost:3000",
     "https://pjdsc-drain.vercel.app",
@@ -15,9 +15,15 @@ origins = [
     "https://ai-drain.vercel.app"
 ]
 
+# Vercel gives every preview deploy a unique hostname, so they can't be listed
+# above. Match them by pattern instead of using "*", which is rejected by
+# browsers when allow_credentials=True.
+origin_regex = r"https://(pjdsc-drain|project-drain|ai-drain|drain)-[a-z0-9-]+\.vercel\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,          # or ["*"] for all origins (less secure)
+    allow_origins=origins,
+    allow_origin_regex=origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
