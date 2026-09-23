@@ -24,10 +24,10 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Check formatting
-        run: ruff format --check app drain tests
+        run: ruff format --check app drain tests scripts
 
       - name: Lint
-        run: ruff check app drain tests
+        run: ruff check app drain tests scripts
 
       - name: Run tests
         run: pytest
