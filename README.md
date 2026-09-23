@@ -28,7 +28,7 @@
 
 ## 🗺️ Overview
 
-The **drAIn Backend** powers the simulation engine and API infrastructure for the drAIn platform. Built with **FastAPI** and **PySWMM**, it provides RESTful endpoints for running **SWMM (Storm Water Management Model)** hydraulic simulations, processing drainage system data, and delivering real-time flood vulnerability analytics to the frontend.
+The **drAIn Backend** powers the simulation engine and API infrastructure for the drAIn platform. Built with **FastAPI** and **PySWMM**, it provides RESTful endpoints for running **SWMM (Storm Water Management Model)** hydraulic simulations, processing drainage system data, and delivering real-time flood hazard analytics to the frontend.
 
 This backend transforms complex hydrological modeling into accessible API services, enabling engineers and planners to run sophisticated urban drainage simulations through simple HTTP requests.
 
@@ -49,7 +49,7 @@ Urban flood modeling typically requires specialized software and technical exper
 * 🚀 **High-Performance API**: FastAPI endpoints optimized for concurrent simulation requests
 * 📊 **Data Pipeline**: Automated preprocessing of raw drainage data for SWMM inputs
 * 🔄 **Scenario Management**: Support for multiple rainfall scenarios and infrastructure configurations
-* 📈 **Result Analytics**: Post-processing of simulation outputs for vulnerability ranking
+* 📈 **Result Analytics**: Post-processing of simulation outputs for flood hazard ranking
 
 ---
 
@@ -98,7 +98,7 @@ drAIn-backend/
 │   ├── rainfall.py        # Design-storm generation
 │   ├── rpt_parser.py      # Parses SWMM .rpt reports
 │   ├── swmm_runner.py     # Runs SWMM
-│   └── vulnerability.py   # k-means risk scoring
+│   └── vulnerability.py   # k-means flood hazard scoring
 ├── data/                  # SWMM network and trained model
 │   ├── Mandaue_Drainage_Network.inp
 │   ├── Mandaue_Drainage_Network.out
@@ -192,6 +192,13 @@ All optional; the defaults cover local development and the known deployments.
 
 ## 🔌 API Endpoints
 
+> **What the rating means.** The `Vulnerability_Category` and
+> `Vulnerability_Score` fields describe *simulated flooding at a node* —
+> how long, how fast, how much, how soon. They contain no exposure data:
+> no population, buildings or critical facilities. A node in an empty field
+> and one outside a hospital are rated the same way. The field names are
+> kept for wire compatibility; the user-facing term is "flood hazard".
+
 ### Simulation Endpoints
 
 A SWMM run takes roughly two minutes — longer than browsers and platform
@@ -201,7 +208,7 @@ proxies keep a request open — so simulations are **queued and polled**.
   and where to poll. Returns `429` when too much work is already outstanding.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
   succeeds. Returns `404` once the result has expired.
-- `GET /health` — liveness probe; also reports whether vulnerability scoring
+- `GET /health` — liveness probe; also reports whether hazard scoring
   is available.
 - `POST /run-simulation` — **deprecated.** Runs the simulation and waits for
   it, holding the request open for the whole run. Kept only so a frontend
