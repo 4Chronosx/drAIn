@@ -35,8 +35,17 @@ class Settings:
 
     #: How many SWMM runs may execute at once. A run is CPU-bound and takes
     #: minutes, so letting requests pile up on a small instance makes every
-    #: one of them slower. Extra requests queue rather than fail.
+    #: one of them slower. Extra requests queue.
     max_concurrent_simulations: int = 1
+
+    #: How much unfinished work the queue will hold before rejecting new
+    #: requests with 429. Without a cap, a burst of callers -- or a bored
+    #: one -- can grow a backlog nobody is waiting on any more.
+    max_queued_simulations: int = 8
+
+    #: How long a finished job's result stays available to poll for. Each
+    #: result is close to a megabyte, so they cannot be kept forever.
+    result_retention_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -45,6 +54,8 @@ class Settings:
             origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX", DEFAULT_ORIGIN_REGEX),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
+            max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
+            result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
         )
 
 

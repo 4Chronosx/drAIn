@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
+
+from app.jobs import JobStatus
 
 
 class NodeOverride(BaseModel):
@@ -66,6 +69,34 @@ class SimulationRequest(BaseModel):
 
     def rainfall_spec(self) -> dict[str, Any]:
         return self.rainfall.model_dump() if self.rainfall else {}
+
+
+class JobAccepted(BaseModel):
+    """Returned when a simulation has been queued."""
+
+    job_id: str
+    #: Always ``queued``: this describes the outcome of the request, not a
+    #: live reading. A worker may already have picked the job up by the time
+    #: this is serialised, so the authoritative state comes from polling.
+    status: JobStatus = JobStatus.QUEUED
+    #: Where to poll for the outcome.
+    poll_url: str
+
+
+class JobState(BaseModel):
+    """The current state of a queued simulation.
+
+    ``result`` is populated only once ``status`` is ``succeeded``, and
+    ``error`` only once it is ``failed``.
+    """
+
+    job_id: str
+    status: JobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
 
 
 class HealthResponse(BaseModel):

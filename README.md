@@ -185,6 +185,8 @@ All optional; the defaults cover local development and the known deployments.
 | `ALLOWED_ORIGIN_REGEX` | Vercel preview pattern | Matches per-deploy preview hostnames |
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
+| `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
+| `RESULT_RETENTION_SECONDS` | `900` | How long a finished result stays pollable |
 
 
 
@@ -192,12 +194,21 @@ All optional; the defaults cover local development and the known deployments.
 
 ### Simulation Endpoints
 
-- `POST /run-simulation` — run a SWMM simulation and return per-node flooding
-  and vulnerability results.
+A SWMM run takes roughly two minutes — longer than browsers and platform
+proxies keep a request open — so simulations are **queued and polled**.
+
+- `POST /simulations` — queue a run. Returns `202` immediately with a job id
+  and where to poll. Returns `429` when too much work is already outstanding.
+- `GET /simulations/{job_id}` — the job's state, and its result once it
+  succeeds. Returns `404` once the result has expired.
 - `GET /health` — liveness probe; also reports whether vulnerability scoring
   is available.
+- `POST /run-simulation` — **deprecated.** Runs the simulation and waits for
+  it, holding the request open for the whole run. Kept only so a frontend
+  deployed before the queued endpoints keeps working; remove it once no
+  deployed client calls it.
 
-`POST /run-simulation` accepts three optional sections:
+`POST /simulations` accepts three optional sections:
 
 ```jsonc
 {
@@ -208,12 +219,28 @@ All optional; the defaults cover local development and the known deployments.
 ```
 
 A request with none of them returns the pre-computed results for the
-unmodified network, so it answers immediately. Anything else runs a real
-simulation, which takes a couple of minutes.
+unmodified network, so it finishes almost immediately. Anything else runs a
+real simulation.
 
-Invalid input returns 422; a simulation that fails returns 500. A successful
-response carries `metadata`, `nodes_list` (for iteration) and `nodes_dict`
-(for lookup by node ID).
+Invalid input is rejected with `422` before anything is queued.
+
+The flow:
+
+```
+POST /simulations            -> 202 { job_id, status: "queued", poll_url }
+GET  /simulations/{job_id}   -> 200 { status: "running" }        # repeat
+GET  /simulations/{job_id}   -> 200 { status: "succeeded", result: { ... } }
+```
+
+`result` carries `metadata`, `nodes_list` (for iteration) and `nodes_dict`
+(for lookup by node ID). A failed run comes back as
+`{ status: "failed", error: "..." }` with a `200` — the request to read the
+job succeeded; the simulation is what failed.
+
+> **Single worker.** Jobs live in the serving process's memory, which is why
+> the Procfile pins `--workers 1`. With more than one, a poll can land on a
+> process that has never heard of the job. Running several workers, or more
+> than one instance, needs a shared job store (Redis, or a table) first.
 
 ---
 

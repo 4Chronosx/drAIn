@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import replace
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.config import settings
+from app.main import app, create_app
 
 
 @pytest.fixture(scope="module")
@@ -83,3 +88,104 @@ def test_a_failing_simulation_returns_an_error_status(client, monkeypatch):
     response = client.post("/run-simulation", json={})
     assert response.status_code == 500
     assert "nodes_list" not in response.json()
+
+
+def poll_until_finished(client, poll_url, timeout=60.0):
+    """Poll a queued simulation the way a client would."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(poll_url)
+        assert response.status_code == 200
+        body = response.json()
+        if body["status"] in {"succeeded", "failed"}:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"{poll_url} did not finish within {timeout}s")
+
+
+class TestQueuedSimulations:
+    """POST /simulations queues work; GET /simulations/{id} collects it."""
+
+    def test_posting_a_simulation_returns_202_not_the_result(self, client):
+        response = client.post("/simulations", json={})
+        assert response.status_code == 202
+
+        body = response.json()
+        assert body["status"] == "queued"
+        assert body["poll_url"] == f"/simulations/{body['job_id']}"
+        assert "nodes_list" not in body
+
+    def test_the_response_points_at_where_to_poll(self, client):
+        response = client.post("/simulations", json={})
+        assert response.headers["location"] == response.json()["poll_url"]
+        assert int(response.headers["retry-after"]) > 0
+
+    def test_polling_yields_the_same_payload_as_the_sync_endpoint(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        finished = poll_until_finished(client, poll_url)
+
+        assert finished["status"] == "succeeded"
+        assert finished["error"] is None
+        assert finished["result"] == client.post("/run-simulation", json={}).json()
+
+    def test_a_finished_job_reports_when_it_ran(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        finished = poll_until_finished(client, poll_url)
+
+        assert finished["created_at"] is not None
+        assert finished["started_at"] is not None
+        assert finished["finished_at"] is not None
+
+    def test_polling_an_unknown_job_is_a_404(self, client):
+        response = client.get("/simulations/does-not-exist")
+        assert response.status_code == 404
+        assert "expired" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"rainfall": {"total_precip": 10, "duration_hr": 48}},
+            {"rainfall": {"total_precip": -5, "duration_hr": 2}},
+        ],
+    )
+    def test_an_impossible_storm_is_rejected_before_it_is_queued(self, client, payload):
+        # Validation failures should not cost a queue slot.
+        assert client.post("/simulations", json=payload).status_code == 422
+
+    def test_a_failing_simulation_finishes_as_failed(self, client, monkeypatch):
+        def explode(*args, **kwargs):
+            raise RuntimeError("SWMM exploded")
+
+        monkeypatch.setattr("app.main.run_simulation", explode)
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        finished = poll_until_finished(client, poll_url)
+
+        assert finished["status"] == "failed"
+        assert finished["result"] is None
+        assert "SWMM exploded" in finished["error"]
+
+    def test_a_full_queue_is_rejected_with_429(self, monkeypatch):
+        # One worker and one slot, held by a simulation that will not return.
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = create_app(replace(settings, max_concurrent_simulations=1, max_queued_simulations=1))
+        try:
+            with TestClient(app) as full_client:
+                assert full_client.post("/simulations", json={}).status_code == 202
+
+                response = full_client.post("/simulations", json={})
+                assert response.status_code == 429
+                assert int(response.headers["retry-after"]) > 0
+        finally:
+            release.set()
+
+
+class TestDeprecatedSyncEndpoint:
+    def test_it_still_returns_the_result_directly(self, client):
+        body = client.post("/run-simulation", json={}).json()
+        assert body["metadata"]["total_nodes"] == 1413
+
+    def test_it_is_marked_deprecated_in_the_schema(self, client):
+        schema = client.get("/openapi.json").json()
+        assert schema["paths"]["/run-simulation"]["post"]["deprecated"] is True
+        assert "deprecated" not in schema["paths"]["/simulations"]["post"]
