@@ -43,6 +43,12 @@ Urban flood modeling typically requires specialized software and technical exper
 * **Processing at Scale**: Handles data preprocessing and result analysis automatically
 * **Cloud-Ready Architecture**: Deployed on Render for reliable, scalable API access
 
+> **Scope.** This serves one hand-built SWMM model of Mandaue. The API is
+> the cheap part; the expensive part is the calibrated network behind it —
+> invert levels, pipe geometry, catchment delineation, survey work — which
+> is months of engineering per city. Another city needs that model built
+> first, not just a redeploy.
+
 #### ⚙️ Core Capabilities
 
 * 🌊 **SWMM Simulation Engine**: Python-based hydraulic and hydrological modeling using PySWMM
@@ -93,16 +99,23 @@ drAIn-backend/
 │   └── schemas.py         # Request/response models
 ├── drain/                 # Domain logic — no web framework imports
 │   ├── cli.py             # Run a simulation without the server
+│   ├── exposure.py        # Population around a node, by barangay
 │   ├── flooding.py        # Assembles the API payload
+│   ├── geo.py             # UTM reprojection, point-in-polygon
+│   ├── hazard.py          # Flood hazard scoring
+│   ├── network.py         # Node locations, read from the .inp
 │   ├── paths.py           # Locations of the bundled model files
 │   ├── rainfall.py        # Design-storm generation
 │   ├── rpt_parser.py      # Parses SWMM .rpt reports
 │   ├── swmm_runner.py     # Runs SWMM
-│   └── vulnerability.py   # k-means flood hazard scoring
+│   └── vulnerability.py   # The superseded k-means model
+├── scripts/               # Analysis, not imported by the server
+│   └── validate_against_reports.py
 ├── data/                  # SWMM network and trained model
 │   ├── Mandaue_Drainage_Network.inp
 │   ├── Mandaue_Drainage_Network.out
 │   ├── Mandaue_Drainage_Network.rpt
+│   ├── mandaue_population.geojson
 │   └── vulnerability_model_k4.pkl
 ├── tests/                 # pytest suite
 ├── Python_Notebooks/      # Data preprocessing notebooks
@@ -190,14 +203,43 @@ All optional; the defaults cover local development and the known deployments.
 
 
 
-## 🔌 API Endpoints
+## 🎯 How nodes are rated
 
-> **What the rating means.** The `Vulnerability_Category` and
-> `Vulnerability_Score` fields describe *simulated flooding at a node* —
-> how long, how fast, how much, how soon. They contain no exposure data:
-> no population, buildings or critical facilities. A node in an empty field
-> and one outside a hospital are rated the same way. The field names are
-> kept for wire compatibility; the user-facing term is "flood hazard".
+Three numbers per node, kept separate so it is clear what each one knows.
+
+**Hazard** — `Vulnerability_Score` (0–1) and `Vulnerability_Category`. How
+badly the node floods: volume, duration as a share of the event, and peak
+rate, each scaled against a fixed reference and weighted. It is monotonic —
+more water, or longer, or faster can only raise it — and a node that floods
+at all can never score zero.
+
+**Exposure** — `Exposure_Score` (0–1), with `Barangay` and
+`Population_Density`. Roughly how many people are around the node, from the
+population density of the barangay it falls in.
+
+**Risk** — `Risk_Score`, hazard × exposure. **Rank work lists on this.**
+Hazard alone puts a drain in an empty lot level with one in the densest
+barangay in the city.
+
+> **What these are not.** The ratings come from simulation, not observation,
+> and have not been checked against field records. Exposure is barangay
+> density, not a count of who is inside the flood footprint — that would
+> need building footprints and a routed inundation surface this project does
+> not have. The reference values that set the hazard scale come from the
+> 95th percentile of the shipped baseline run, not from a damage study, and
+> are the first thing that should change once there is field evidence. Use
+> `scripts/validate_against_reports.py` to check the ratings against citizen
+> reports.
+
+`Legacy_Cluster_Category` and `Legacy_Cluster_Score` carry the previous
+k-means output, kept so the two can be compared. It rated 272 nodes that
+flooded — one for 11.7 hours — as "No risk", and its top-50 work list was
+identical to sorting on flood volume alone.
+
+The field names still say "Vulnerability" because they are the wire
+contract. The user-facing term is "flood hazard".
+
+## 🔌 API Endpoints
 
 ### Simulation Endpoints
 
