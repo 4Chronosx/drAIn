@@ -16,7 +16,7 @@
   <br />
   <p align="center">
     <a href="#"><img alt="Status" src="https://img.shields.io/badge/status-Beta-yellow?style=flat&color=yellow" /></a>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white&style=flat" /></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
     <a href="https://github.com/4Chronosx/BACKEND-DrAin/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/BACKEND-DrAin?color=coral&logo=git&logoColor=white" /></a>
   </p>
   <a href="https://github.com/4Chronosx/BACKEND-DrAin/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -41,7 +41,7 @@ Urban flood modeling typically requires specialized software and technical exper
 * **Abstracting Complexity**: Wraps SWMM's Python API in intuitive REST endpoints
 * **Enabling Real-Time Simulation**: Supports interactive "what-if" scenarios for infrastructure planning
 * **Processing at Scale**: Handles data preprocessing and result analysis automatically
-* **Cloud-Ready Architecture**: Deployed on Railway for reliable, scalable API access
+* **Cloud-Ready Architecture**: Deployed on Render for reliable, scalable API access
 
 #### ⚙️ Core Capabilities
 
@@ -58,7 +58,7 @@ Urban flood modeling typically requires specialized software and technical exper
 ### Core Framework
 <p align="left">
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white&style=flat" /></a>
-  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white&style=flat" /></a>
+  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
   <a href="https://www.uvicorn.org/"><img alt="Uvicorn" src="https://img.shields.io/badge/Uvicorn-2094F3?logo=gunicorn&logoColor=white&style=flat" /></a>
 </p>
 
@@ -67,7 +67,6 @@ Urban flood modeling typically requires specialized software and technical exper
   <a href="https://www.epa.gov/water-research/storm-water-management-model-swmm"><img alt="PySWMM" src="https://img.shields.io/badge/PySWMM-0078D4?logo=python&logoColor=white&style=flat" /></a>
   <a href="https://scikit-learn.org/"><img alt="scikit-learn" src="https://img.shields.io/badge/scikit--learn-F7931E?logo=scikitlearn&logoColor=white&style=flat" /></a>
   <a href="https://numpy.org/"><img alt="NumPy" src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white&style=flat" /></a>
-  <a href="https://pandas.pydata.org/"><img alt="Pandas" src="https://img.shields.io/badge/Pandas-150458?logo=pandas&logoColor=white&style=flat" /></a>
 </p>
 
 ### Data Processing
@@ -78,7 +77,7 @@ Urban flood modeling typically requires specialized software and technical exper
 
 ### Deployment
 <p align="left">
-  <a href="https://railway.app/"><img alt="Railway" src="https://img.shields.io/badge/Railway-0B0D0E?logo=railway&logoColor=white&style=flat" /></a>
+  <a href="https://render.com/"><img alt="Render" src="https://img.shields.io/badge/Render-46E3B7?logo=render&logoColor=white&style=flat" /></a>
 </p>
 
 ---
@@ -86,29 +85,33 @@ Urban flood modeling typically requires specialized software and technical exper
 ## 📁 Project Structure
 
 ```
-BACKEND-DRAIN/
-├── __pycache__/           # Python cache files
-├── data/                  # SWMM model files and data
-│   ├── Mandaue_Drainage_Network_mod.inp
-│   ├── Mandaue_Drainage_Network_mod.out
-│   ├── Mandaue_Drainage_Network_mod.rpt
+drAIn-backend/
+├── app/                   # HTTP layer (FastAPI)
+│   ├── config.py          # Settings read from the environment
+│   ├── logging_config.py  # Logging setup
+│   ├── main.py            # App factory, CORS, routes
+│   └── schemas.py         # Request/response models
+├── drain/                 # Domain logic — no web framework imports
+│   ├── cli.py             # Run a simulation without the server
+│   ├── flooding.py        # Assembles the API payload
+│   ├── paths.py           # Locations of the bundled model files
+│   ├── rainfall.py        # Design-storm generation
+│   ├── rpt_parser.py      # Parses SWMM .rpt reports
+│   ├── swmm_runner.py     # Runs SWMM
+│   └── vulnerability.py   # k-means risk scoring
+├── data/                  # SWMM network and trained model
 │   ├── Mandaue_Drainage_Network.inp
 │   ├── Mandaue_Drainage_Network.out
 │   ├── Mandaue_Drainage_Network.rpt
 │   └── vulnerability_model_k4.pkl
+├── tests/                 # pytest suite
 ├── Python_Notebooks/      # Data preprocessing notebooks
 │   ├── INP_FILE_GENERATOR.ipynb
 │   └── KMEANS_MODEL.ipynb
-├── tools/                 # Utility scripts
-│   ├── __pycache__/
-│   ├── swmm_extract.py   # SWMM data extraction
-│   └── swmm_tools.py     # SWMM helper functions
-├── venv/                  # Virtual environment
-├── Procfile              # Process configuration
-├── README.md             # This file
-├── requirements.txt      # Python dependencies
-├── server.py             # FastAPI server
-└── test.py               # Test suite
+├── Procfile               # Process configuration
+├── pyproject.toml         # ruff and pytest configuration
+├── requirements.txt       # Pinned runtime dependencies
+└── requirements-dev.txt   # Adds pytest and ruff
 ```
 
 ---
@@ -121,9 +124,10 @@ Follow these steps to set up and run the **drAIn Backend** locally.
 
 Make sure you have installed:
 
-- [Python](https://www.python.org/) (v3.9+)
+- [Python](https://www.python.org/) (v3.12+)
 - [pip](https://pip.pypa.io/) or [conda](https://docs.conda.io/)
-- [SWMM](https://www.epa.gov/water-research/storm-water-management-model-swmm) (for local simulations)
+
+The SWMM engine ships with `pyswmm`, so no separate install is needed.
 
 ---
 
@@ -140,6 +144,9 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# ...or, to also get pytest and ruff
+pip install -r requirements-dev.txt
 ```
 
 ---
@@ -148,24 +155,71 @@ pip install -r requirements.txt
 
 ```bash
 # Start the FastAPI server
-uvicorn server:app --reload
+uvicorn app.main:app --reload
 
-# Server will be available at:
-# http://localhost:3000
+# Server will be available at http://localhost:8000
+# Interactive API docs at http://localhost:8000/docs
 ```
+
+To run a simulation without starting the server:
+
+```bash
+python -m drain.cli --precip 400 --duration 24 --node I-4
+```
+
+### ✅ Tests and linting
+
+```bash
+pytest
+ruff check drain app tests
+ruff format --check drain app tests
+```
+
+### 🔧 Configuration
+
+All optional; the defaults cover local development and the known deployments.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ALLOWED_ORIGINS` | the production and localhost origins | Comma-separated CORS allowlist |
+| `ALLOWED_ORIGIN_REGEX` | Vercel preview pattern | Matches per-deploy preview hostnames |
+| `LOG_LEVEL` | `INFO` | Root log level |
+| `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 
 
 
 ## 🔌 API Endpoints
 
 ### Simulation Endpoints
-- `POST /run-simulation` - Run a new SWMM simulation and Retrieve simulation results
+
+- `POST /run-simulation` — run a SWMM simulation and return per-node flooding
+  and vulnerability results.
+- `GET /health` — liveness probe; also reports whether vulnerability scoring
+  is available.
+
+`POST /run-simulation` accepts three optional sections:
+
+```jsonc
+{
+  "nodes":    { "I-4": { "inv_elev": 16, "init_depth": 0 } },  // per-node overrides
+  "links":    { "C-1": { "init_flow": 2.5 } },                 // per-conduit overrides
+  "rainfall": { "total_precip": 400, "duration_hr": 24 }       // design storm, max 24 h
+}
+```
+
+A request with none of them returns the pre-computed results for the
+unmodified network, so it answers immediately. Anything else runs a real
+simulation, which takes a couple of minutes.
+
+Invalid input returns 422; a simulation that fails returns 500. A successful
+response carries `metadata`, `nodes_list` (for iteration) and `nodes_dict`
+(for lookup by node ID).
 
 ---
 
 ## 📊 Data Processing
 
-The `notebooks/` directory contains Google Colab notebooks for:
+The `Python_Notebooks/` directory contains Google Colab notebooks for:
 
 - **Data Preprocessing**: Converting raw drainage survey data into SWMM-compatible formats
 - **Geospatial Processing**: Handling coordinate systems and network topology
@@ -182,15 +236,15 @@ Raw datasets used for SWMM simulations are available at:
 
 
 
-## 🚂 Railway Deployment
+## 🚀 Deployment
 
-The backend is automatically deployed to Railway and serves the production API:
+The backend is deployed on Render and serves the production API:
 
-1. Connect your GitHub repository to Railway
-2. Configure environment variables
-3. Railway auto-deploys on every push to `main`
+1. Connect your GitHub repository to Render
+2. Configure environment variables (see Configuration above)
+3. Render auto-deploys on every push to `main`
 
-**Production API**: `https://pjdsc-drain-backend.up.railway.app`
+`Procfile` starts `app.main:app` and binds `$PORT`.
 
 ---
 
