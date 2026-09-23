@@ -1,5 +1,14 @@
-fastapi
-uvicorn
-pandas
-pyswmm
-scikit-learn
+# Pinned deliberately. The vulnerability model is an unpickled scikit-learn
+# estimator, so an unpinned install can silently change how nodes are scored
+# between deploys. Re-pin only alongside a parity check against data/.
+
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+
+# Numerics
+numpy==2.5.3
+scikit-learn==1.9.1
+
+# SWMM engine
+pyswmm==2.1.0
