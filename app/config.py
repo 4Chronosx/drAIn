@@ -1,0 +1,51 @@
+"""Runtime configuration, read from the environment."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+#: Origins always permitted, covering local development and the named
+#: production deployments.
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://localhost:3000",
+    "https://pjdsc-drain.vercel.app",
+    "https://project-drain.vercel.app",
+    "https://ai-drain.vercel.app",
+)
+
+#: Vercel gives every preview deployment a unique hostname, so they cannot be
+#: enumerated. Match them by pattern -- browsers reject a bare "*" when
+#: credentials are allowed.
+DEFAULT_ORIGIN_REGEX = r"https://(pjdsc-drain|project-drain|ai-drain|drain)-[a-z0-9-]+\.vercel\.app"
+
+
+def _env_list(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Settings for one process, resolved once at import time."""
+
+    allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
+    origin_regex: str = DEFAULT_ORIGIN_REGEX
+    log_level: str = "INFO"
+
+    #: How many SWMM runs may execute at once. A run is CPU-bound and takes
+    #: minutes, so letting requests pile up on a small instance makes every
+    #: one of them slower. Extra requests queue rather than fail.
+    max_concurrent_simulations: int = 1
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        return cls(
+            allowed_origins=_env_list("ALLOWED_ORIGINS") or DEFAULT_ALLOWED_ORIGINS,
+            origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX", DEFAULT_ORIGIN_REGEX),
+            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
+        )
+
+
+settings = Settings.from_env()
