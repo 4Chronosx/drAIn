@@ -13,6 +13,9 @@ from typing import Any
 
 from pyswmm import NodeSeries, Output
 
+from drain.exposure import UNKNOWN_EXPOSURE, exposure_for
+from drain.hazard import DEFAULT_EVENT_HOURS, hazard_for
+from drain.network import node_locations
 from drain.rpt_parser import FloodedNode, parse_flooding_summary
 from drain.vulnerability import NodeFeatures, VulnerabilityModel, load_model
 
@@ -52,6 +55,7 @@ def build_flooding_summary(
     rpt_path: Path,
     out_path: Path,
     model: VulnerabilityModel | None = None,
+    event_hours: float = DEFAULT_EVENT_HOURS,
 ) -> dict[str, Any]:
     """Build the full node flooding payload for a completed simulation.
 
@@ -97,8 +101,27 @@ def build_flooding_summary(
     nodes_list: list[dict[str, Any]] = []
     nodes_dict: dict[str, dict[str, Any]] = {}
 
+    locations = node_locations()
+    inconsistent = 0
+
     for node_id, feature, prediction in zip(node_ids, features, predictions, strict=True):
         summary = flooded.get(node_id, _NO_FLOODING)
+
+        hazard = hazard_for(
+            total_flood_volume=summary.total_flood_volume,
+            hours_flooded=summary.hours_flooded,
+            maximum_rate_cms=summary.maximum_rate_cms,
+            event_hours=event_hours,
+        )
+        exposure = exposure_for(locations[node_id]) if node_id in locations else UNKNOWN_EXPOSURE
+
+        # The report's summary table and the binary output disagree for some
+        # nodes: the first says the node flooded, the second shows no
+        # positive overflow anywhere in its series. Counted so the mismatch
+        # is visible rather than silently shaping the results.
+        if summary.hours_flooded > 0 and feature.time_after_raining_min >= NO_OVERFLOW_MINUTES:
+            inconsistent += 1
+
         row = {
             "Hours_Flooded": summary.hours_flooded,
             "Maximum_Rate_CMS": summary.maximum_rate_cms,
@@ -106,14 +129,32 @@ def build_flooding_summary(
             "Time_of_Max_hr_min": summary.time_of_max_minutes,
             "Total_Flood_Volume_10e6_ltr": summary.total_flood_volume,
             "Time_After_Raining_min": feature.time_after_raining_min,
-            "Vulnerability_Category": prediction.category if prediction else "N/A",
-            "Vulnerability_Score": prediction.score if prediction else 0.0,
+            # Hazard: how badly this node floods. Transparent and monotonic.
+            "Vulnerability_Category": hazard.category,
+            "Vulnerability_Score": hazard.score,
+            # Exposure: roughly how many people are around it.
+            "Barangay": exposure.barangay,
+            "Population_Density": exposure.density,
+            "Exposure_Score": round(exposure.score, 4),
+            # Risk: the two together, which is what a work list should rank on.
+            "Risk_Score": round(hazard.score * exposure.score, 6),
+            # The previous k-means output, kept for comparison.
+            "Legacy_Cluster_Category": prediction.category if prediction else "N/A",
+            "Legacy_Cluster_Score": prediction.score if prediction else 0.0,
         }
         nodes_dict[node_id] = row
         nodes_list.append({"Node": node_id, **row})
 
     flooded_count = sum(1 for row in nodes_list if row["Hours_Flooded"] > 0)
     logger.info("Built flooding summary: %d nodes, %d flooded", len(nodes_list), flooded_count)
+    if inconsistent:
+        logger.warning(
+            "%d nodes are reported as flooded in %s but show no overflow in %s; "
+            "their time-to-overflow is unusable.",
+            inconsistent,
+            Path(rpt_path).name,
+            Path(out_path).name,
+        )
 
     return {
         "metadata": {
@@ -125,6 +166,17 @@ def build_flooding_summary(
             "rpt_file": Path(rpt_path).name,
             "out_file": Path(out_path).name,
             "model_file": "N/A" if model is None else "vulnerability_model_k4.pkl",
+            "event_hours": event_hours,
+            # Nodes the report calls flooded but the binary output does not.
+            "inconsistent_nodes": inconsistent,
+            "scoring": {
+                "hazard": "Vulnerability_Score: 0-1, from flood volume, duration and peak rate.",
+                "exposure": (
+                    "Exposure_Score: 0-1, from the population density of the containing barangay."
+                ),
+                "risk": "Risk_Score: hazard x exposure. Rank work lists on this.",
+                "legacy": "Legacy_Cluster_*: the previous k-means output, retained for comparison.",
+            },
             "structure_info": {
                 "nodes_list": "Array format - use for iteration and listing all nodes",
                 "nodes_dict": "Dictionary format - use for fast O(1) lookup by node ID",

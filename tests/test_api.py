@@ -44,14 +44,25 @@ def test_baseline_exposes_the_same_nodes_as_a_list_and_a_dict(client):
 def test_node_rows_carry_the_documented_fields(client):
     body = client.post("/run-simulation", json={}).json()
     assert set(body["nodes_dict"]["I-4"]) == {
+        # Raw flooding figures from the simulation.
         "Hours_Flooded",
         "Maximum_Rate_CMS",
         "Time_of_Max_days",
         "Time_of_Max_hr_min",
         "Total_Flood_Volume_10e6_ltr",
         "Time_After_Raining_min",
+        # Hazard: how badly the node floods.
         "Vulnerability_Category",
         "Vulnerability_Score",
+        # Exposure: who is around it.
+        "Barangay",
+        "Population_Density",
+        "Exposure_Score",
+        # The two combined.
+        "Risk_Score",
+        # The superseded k-means output.
+        "Legacy_Cluster_Category",
+        "Legacy_Cluster_Score",
     }
 
 

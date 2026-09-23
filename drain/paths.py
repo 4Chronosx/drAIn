@@ -18,6 +18,10 @@ BASE_OUT = DATA_DIR / "Mandaue_Drainage_Network.out"
 #: Trained k-means vulnerability model.
 VULNERABILITY_MODEL = DATA_DIR / "vulnerability_model_k4.pkl"
 
+#: Barangay boundaries with population counts, used to weight hazard by how
+#: many people a flooded node actually affects.
+POPULATION_BOUNDARIES = DATA_DIR / "mandaue_population.geojson"
+
 
 def mod_artifacts(inp_path: Path) -> tuple[Path, Path]:
     """Return the ``.rpt`` and ``.out`` paths pyswmm writes for a pre-configured run.
