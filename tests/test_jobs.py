@@ -253,3 +253,56 @@ class TestLateResults:
         finally:
             release.set()
             store.shutdown()
+
+
+def wait_until(predicate, timeout=5.0):
+    """Block until ``predicate()`` is true, or fail the test."""
+    pause = threading.Event()
+    for _ in range(int(timeout * 100)):
+        if predicate():
+            return
+        pause.wait(0.01)
+    raise AssertionError(f"condition not met within {timeout}s")
+
+
+def hang_until(release, result=None):
+    """Work that blocks until ``release`` is set, like a hung SWMM run."""
+
+    def work():
+        release.wait(10)
+        return result if result is not None else {}
+
+    return work
+
+
+class TestSnapshots:
+    """Regression: ``get`` handed out the live job, which the worker kept
+    mutating, so a reader could see SUCCEEDED with the result still unset."""
+
+    def test_get_returns_a_snapshot_not_the_live_job(self, store):
+        release = threading.Event()
+        try:
+            job = store.submit(hang_until(release, {"ok": True}))
+            before = store.get(job.id)
+            release.set()
+            wait_for(job, store)
+
+            assert not before.is_finished
+            assert before.result is None
+        finally:
+            release.set()
+
+    def test_submit_returns_a_snapshot(self, store):
+        job = store.submit(lambda: {"ok": True})
+        wait_for(job, store)
+        assert job.status is JobStatus.QUEUED
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_a_finished_job_has_exactly_one_of_result_and_error(self, store, fails):
+        def work():
+            if fails:
+                raise RuntimeError("boom")
+            return {"ok": True}
+
+        job = wait_for(store.submit(work), store)
+        assert (job.result is None) != (job.error is None)

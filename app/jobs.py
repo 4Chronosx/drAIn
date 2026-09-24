@@ -16,7 +16,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -92,8 +92,8 @@ class JobStore:
         burst of requests from growing an unbounded backlog that nobody is
         still waiting on.
         """
-        job, _ = self._enqueue(work)
-        return job
+        _, accepted, _ = self._enqueue(work)
+        return accepted
 
     def submit_and_wait(self, work: Callable[[], dict[str, Any]]) -> SimulationJob:
         """Queue a simulation and block until it finishes.
@@ -102,11 +102,16 @@ class JobStore:
         pool means it shares the worker limit and the queue cap rather than
         running unbounded alongside the queued ones.
         """
-        job, future = self._enqueue(work)
+        job, _, future = self._enqueue(work)
         future.result()
-        return job
+        with self._lock:
+            return replace(job)
 
-    def _enqueue(self, work: Callable[[], dict[str, Any]]) -> tuple[SimulationJob, Future[None]]:
+    def _enqueue(
+        self, work: Callable[[], dict[str, Any]]
+    ) -> tuple[SimulationJob, SimulationJob, Future[None]]:
+        """Queue work. Returns the live job, a snapshot of it as accepted,
+        and the future running it."""
         with self._lock:
             self._drop_expired()
             outstanding = sum(1 for job in self._jobs.values() if not job.is_finished)
@@ -115,16 +120,23 @@ class JobStore:
 
             job = SimulationJob(id=uuid.uuid4().hex)
             self._jobs[job.id] = job
+            accepted = replace(job)
 
         future = self._executor.submit(self._run, job, work)
         logger.info("Queued simulation %s", job.id)
-        return job, future
+        return job, accepted, future
 
     def get(self, job_id: str) -> SimulationJob | None:
-        """Look a job up, or ``None`` if it never existed or has expired."""
+        """Look a job up, or ``None`` if it never existed or has expired.
+
+        Returns a copy taken under the lock. The worker thread keeps updating
+        the live job, so a caller reading that one field by field could see
+        ``succeeded`` before the result had been stored.
+        """
         with self._lock:
             self._drop_expired()
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            return replace(job) if job is not None else None
 
     def _run(self, job: SimulationJob, work: Callable[[], dict[str, Any]]) -> None:
         with self._lock:
