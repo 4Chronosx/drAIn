@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from drain import flooding
+from drain.exposure import UNKNOWN_EXPOSURE, exposure_for
 from drain.flooding import NO_OVERFLOW_MINUTES, _minutes_until_overflow, build_flooding_summary
+from drain.hazard import hazard_for
+from drain.network import node_locations
 from drain.paths import BASE_OUT, BASE_RPT
 
 
@@ -54,3 +57,54 @@ class TestMinutesUntilOverflow:
         flooded = [r for r in rows if r["Hours_Flooded"] > 0]
         assert flooded
         assert all(r["Time_After_Raining_min"] is None for r in flooded)
+
+
+class TestScores:
+    def test_risk_is_hazard_times_exposure(self, baseline):
+        for row in baseline["nodes_list"]:
+            assert row["Risk_Score"] == pytest.approx(
+                row["Vulnerability_Score"] * row["Exposure_Score"], abs=1e-4
+            )
+
+    def test_the_hazard_columns_come_from_the_scorer(self, baseline):
+        row = max(baseline["nodes_list"], key=lambda r: r["Total_Flood_Volume_10e6_ltr"])
+        hazard = hazard_for(
+            total_flood_volume=row["Total_Flood_Volume_10e6_ltr"],
+            hours_flooded=row["Hours_Flooded"],
+            maximum_rate_cms=row["Maximum_Rate_CMS"],
+            event_hours=baseline["metadata"]["event_hours"],
+        )
+        assert row["Vulnerability_Score"] == hazard.score
+        assert row["Vulnerability_Category"] == hazard.category
+
+    def test_the_exposure_columns_come_from_the_node_location(self, baseline):
+        node_id, point = next(iter(node_locations().items()))
+        exposure = exposure_for(point)
+        row = baseline["nodes_dict"][node_id]
+        assert row["Barangay"] == exposure.barangay
+        assert row["Exposure_Score"] == round(exposure.score, 4)
+
+    def test_a_node_without_coordinates_gets_neutral_exposure(self, monkeypatch):
+        monkeypatch.setattr(flooding, "node_locations", lambda: {})
+        rows = build_flooding_summary(BASE_RPT, BASE_OUT)["nodes_list"]
+        assert all(r["Barangay"] is None for r in rows)
+        assert all(r["Exposure_Score"] == UNKNOWN_EXPOSURE.score for r in rows)
+        assert all(r["Population_Density"] is None for r in rows)
+
+
+class TestInconsistentNodes:
+    def test_it_counts_nodes_the_report_floods_but_the_output_does_not(self, baseline):
+        rows = baseline["nodes_list"]
+        expected = sum(
+            1 for r in rows if r["Hours_Flooded"] > 0 and r["Time_After_Raining_min"] is None
+        )
+        assert expected > 0
+        assert baseline["metadata"]["inconsistent_nodes"] == expected
+
+    def test_consistent_nodes_are_not_counted(self, baseline):
+        # Every node the output shows overflowing has a time; none of those
+        # may be in the count, so it cannot exceed the flooded nodes left.
+        rows = baseline["nodes_list"]
+        timed = sum(1 for r in rows if r["Time_After_Raining_min"] is not None)
+        flooded = baseline["metadata"]["flooded_nodes"]
+        assert baseline["metadata"]["inconsistent_nodes"] == flooded - timed

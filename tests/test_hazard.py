@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from drain.hazard import NO_HAZARD, categorise, hazard_for
+from drain.hazard import NO_HAZARD, _clamp_fraction, categorise, hazard_for
 
 
 class TestNothingThatFloodsIsCalledSafe:
@@ -79,6 +79,17 @@ class TestScale:
         assert hazard_for(-5.0, 3.0, -1.0).score >= 0
 
 
+class TestClampFraction:
+    @pytest.mark.parametrize("full_scale", [0.0, -1.0])
+    def test_a_zero_or_negative_full_scale_scores_nothing(self, full_scale):
+        assert _clamp_fraction(5.0, full_scale) == 0.0
+
+    def test_values_are_pinned_between_zero_and_one(self):
+        assert _clamp_fraction(-3.0, 10.0) == 0.0
+        assert _clamp_fraction(5.0, 10.0) == 0.5
+        assert _clamp_fraction(50.0, 10.0) == 1.0
+
+
 class TestNonFiniteInputs:
     """Regression: a NaN measurement gave score=nan, category "Low".
 
@@ -124,6 +135,21 @@ class TestNonFiniteInputs:
 
 
 class TestCategories:
+    @pytest.mark.parametrize(
+        ("score", "category"),
+        [
+            # Pinned to the current thresholds: a score exactly on a
+            # boundary stays in the band below it.
+            (0.25, "Low"),
+            (0.250001, "Medium"),
+            (0.5, "Medium"),
+            (0.500001, "High"),
+            (1.0, "High"),
+        ],
+    )
+    def test_a_score_on_a_boundary_stays_in_the_lower_band(self, score, category):
+        assert categorise(score) == category
+
     def test_the_bands_ascend_with_the_score(self):
         assert categorise(0.0) == NO_HAZARD
         assert categorise(0.1) == "Low"

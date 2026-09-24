@@ -141,6 +141,19 @@ class TestExposureScore:
         densities = sorted(scores)
         assert scores[densities[0]] < scores[densities[-1]]
 
+    def test_the_densest_barangay_scores_one(self, barangays, monkeypatch):
+        densest = max((b for b in barangays if b.density), key=lambda b: b.density)
+        monkeypatch.setattr(exposure, "barangay_at", lambda point: densest)
+        assert exposure_for((0.0, 0.0)).score == 1.0
+
+    def test_with_no_scale_to_measure_against_the_score_is_neutral(self, barangays, monkeypatch):
+        mapped = next(b for b in barangays if b.density)
+        monkeypatch.setattr(exposure, "barangay_at", lambda point: mapped)
+        monkeypatch.setattr(exposure, "_highest_density", lambda: 0.0)
+        result = exposure_for((0.0, 0.0))
+        assert result.score == 0.5
+        assert result.barangay == mapped.name
+
     def test_an_unmapped_location_is_neutral_not_zero(self):
         # Zeroing it would quietly drop those nodes off a risk-ranked list.
         exposure = exposure_for((0.0, 0.0))
