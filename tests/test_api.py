@@ -304,3 +304,16 @@ class TestDeprecatedSyncEndpoint:
         schema = client.get("/openapi.json").json()
         assert schema["paths"]["/run-simulation"]["post"]["deprecated"] is True
         assert "deprecated" not in schema["paths"]["/simulations"]["post"]
+
+
+def test_browsers_may_read_the_polling_headers(client):
+    """Regression: CORS did not expose Retry-After or Location, so a browser
+    client could not read either, and had to guess how long to wait."""
+    response = client.post(
+        "/simulations", json={}, headers={"Origin": "https://project-drain.vercel.app"}
+    )
+    exposed = {
+        header.strip().lower()
+        for header in response.headers["access-control-expose-headers"].split(",")
+    }
+    assert {"retry-after", "location"} <= exposed

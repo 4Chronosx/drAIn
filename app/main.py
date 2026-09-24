@@ -116,6 +116,9 @@ def create_app(config: Settings = settings) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Browsers hide response headers from scripts unless they are listed
+        # here, and the polling client needs both.
+        expose_headers=["Retry-After", "Location"],
     )
 
     @app.get("/health", response_model=HealthResponse)
