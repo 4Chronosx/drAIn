@@ -21,9 +21,9 @@ from drain.vulnerability import NodeFeatures, VulnerabilityModel, load_model
 
 logger = logging.getLogger(__name__)
 
-#: Internal marker for "no overflow time". The legacy k-means model takes a
-#: number here and was fitted with this value, so it is kept internally; the
-#: payload serves null in its place (see ``Time_After_Raining_min`` below).
+#: Internal marker for "no overflow time". The legacy k-means model needs a
+#: number for every node, so this stands in for one internally; the payload
+#: never serves it and reports null instead (see ``Time_After_Raining_min``).
 NO_OVERFLOW_MINUTES = 9999.0
 
 #: Figures reported for a node that does not appear in the flooding summary.
