@@ -20,6 +20,7 @@ thing that should change once there is field evidence to set them against.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Final
 
@@ -53,10 +54,20 @@ DEFAULT_EVENT_HOURS: Final = 24.0
 
 
 def _clamp_fraction(value: float, full_scale: float) -> float:
-    """Scale a measurement to 0-1, with anything past full scale pinned to 1."""
-    if full_scale <= 0:
+    """Scale a measurement to 0-1, with anything past full scale pinned to 1.
+
+    Infinity pins to 1 like any other value past full scale. A NaN scores 0:
+    it is a missing figure, and letting it through would make the whole
+    score NaN, which is not valid JSON.
+    """
+    if not (math.isfinite(full_scale) and full_scale > 0) or math.isnan(value):
         return 0.0
     return min(max(value, 0.0) / full_scale, 1.0)
+
+
+def _known(value: float) -> float:
+    """A measurement, with a missing (NaN) one read as nothing."""
+    return 0.0 if math.isnan(value) else value
 
 
 @dataclass(frozen=True)
@@ -84,11 +95,18 @@ def hazard_for(
     as a share of it, because a one-hour event cannot flood anything for
     twenty hours and should not be penalised against a scale that assumes it
     could.
+
+    Non-finite input never reaches the payload: a NaN measurement counts as
+    zero, an infinite one as full scale, and a non-finite event length falls
+    back to the default.
     """
+    total_flood_volume = _known(total_flood_volume)
+    hours_flooded = _known(hours_flooded)
+    maximum_rate_cms = _known(maximum_rate_cms)
     if hours_flooded <= 0 and total_flood_volume <= 0 and maximum_rate_cms <= 0:
         return Hazard(score=0.0, category=NO_HAZARD)
 
-    if event_hours <= 0:
+    if not math.isfinite(event_hours) or event_hours <= 0:
         event_hours = DEFAULT_EVENT_HOURS
 
     score = (
@@ -101,8 +119,11 @@ def hazard_for(
 
 
 def categorise(score: float) -> str:
-    """Bucket a hazard score. Any flooding at all is at least Low."""
-    if score <= 0:
+    """Bucket a hazard score. Any flooding at all is at least Low.
+
+    A NaN score is not flooding anyone can vouch for, so it is not rated.
+    """
+    if not score > 0:
         return NO_HAZARD
     for threshold, name in CATEGORY_THRESHOLDS:
         if score > threshold:

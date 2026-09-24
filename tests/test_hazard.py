@@ -6,6 +6,9 @@ are pinned deliberately rather than incidentally.
 
 from __future__ import annotations
 
+import json
+import math
+
 import pytest
 
 from drain.hazard import NO_HAZARD, categorise, hazard_for
@@ -74,6 +77,50 @@ class TestScale:
 
     def test_negative_measurements_do_not_produce_negative_scores(self):
         assert hazard_for(-5.0, 3.0, -1.0).score >= 0
+
+
+class TestNonFiniteInputs:
+    """Regression: a NaN measurement gave score=nan, category "Low".
+
+    NaN is not valid JSON, so one bad figure broke the whole payload for a
+    strict parser, and "Low" claimed a rating nothing supported.
+    """
+
+    @pytest.mark.parametrize(
+        "measurements",
+        [
+            (math.nan, 2.0, 0.3),
+            (5.0, math.nan, 0.3),
+            (5.0, 2.0, math.nan),
+            (math.nan, math.nan, math.nan),
+            (math.inf, 2.0, 0.3),
+            (-math.inf, 2.0, 0.3),
+            (5.0, math.inf, 0.3),
+            (5.0, 2.0, -math.inf),
+        ],
+    )
+    def test_the_score_is_always_a_finite_fraction(self, measurements):
+        hazard = hazard_for(*measurements)
+        assert math.isfinite(hazard.score)
+        assert 0.0 <= hazard.score <= 1.0
+        json.dumps({"score": hazard.score}, allow_nan=False)
+
+    def test_a_missing_measurement_counts_for_nothing(self):
+        assert hazard_for(5.0, math.nan, 0.3) == hazard_for(5.0, 0.0, 0.3)
+
+    def test_nothing_but_missing_measurements_is_no_hazard(self):
+        assert hazard_for(math.nan, math.nan, math.nan).category == NO_HAZARD
+
+    def test_an_infinite_measurement_saturates(self):
+        assert hazard_for(math.inf, 0.0, 0.0) == hazard_for(1e9, 0.0, 0.0)
+
+    @pytest.mark.parametrize("event_hours", [math.nan, math.inf, -math.inf])
+    def test_a_non_finite_event_length_falls_back_to_the_default(self, event_hours):
+        assert hazard_for(5.0, 2.0, 0.2, event_hours=event_hours) == hazard_for(5.0, 2.0, 0.2)
+
+    @pytest.mark.parametrize("score", [math.nan, -math.inf])
+    def test_a_non_finite_score_is_not_given_a_rating(self, score):
+        assert categorise(score) == NO_HAZARD
 
 
 class TestCategories:
