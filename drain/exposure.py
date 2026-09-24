@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from drain.geo import Ring, bounding_box, point_in_polygon
@@ -57,11 +56,24 @@ class Barangay:
         return point_in_polygon(point, self.rings)
 
 
-@lru_cache(maxsize=1)
+#: Boundaries already read, by path. Only successful reads are kept.
+_loaded: dict[Path, tuple[Barangay, ...]] = {}
+
+
 def load_barangays(path: Path = POPULATION_BOUNDARIES) -> tuple[Barangay, ...]:
-    """Read the barangay boundaries, or return empty if they are unavailable."""
+    """Read the barangay boundaries, or return empty if they are unavailable.
+
+    A successful read is cached. A failed one is not: caching it would leave
+    every later run without exposure until the process restarted, over what
+    may have been a passing error.
+    """
+    path = Path(path)
+    cached = _loaded.get(path)
+    if cached is not None:
+        return cached
+
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         logger.exception("Could not read population boundaries from %s", path)
         return ()
@@ -91,7 +103,9 @@ def load_barangays(path: Path = POPULATION_BOUNDARIES) -> tuple[Barangay, ...]:
             )
 
     logger.info("Loaded %d barangay boundaries from %s", len(barangays), path.name)
-    return tuple(barangays)
+    loaded = tuple(barangays)
+    _loaded[path] = loaded
+    return loaded
 
 
 def barangay_at(point: tuple[float, float]) -> Barangay | None:
@@ -128,11 +142,24 @@ class Exposure:
 UNKNOWN_EXPOSURE = Exposure(barangay=None, density=None, score=0.5)
 
 
-@lru_cache(maxsize=1)
+#: The exposure scale, once it has been worked out from real boundaries.
+_highest: float | None = None
+
+
 def _highest_density() -> float:
-    """The densest barangay, which exposure is scaled against."""
+    """The densest barangay, which exposure is scaled against.
+
+    Cached only once there are densities to scale against, for the same
+    reason :func:`load_barangays` does not cache a failure.
+    """
+    global _highest
+    if _highest is not None:
+        return _highest
     densities = [b.density for b in load_barangays() if b.density is not None]
-    return max(densities) if densities else 0.0
+    if not densities:
+        return 0.0
+    _highest = max(densities)
+    return _highest
 
 
 def exposure_for(point: tuple[float, float]) -> Exposure:

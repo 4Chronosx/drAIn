@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from drain import exposure
 from drain.exposure import (
     UNKNOWN_EXPOSURE,
     Barangay,
@@ -63,6 +64,51 @@ class TestBoundaries:
             encoding="utf-8",
         )
         assert load_barangays(path) == ()
+
+
+def square(name, density):
+    return {
+        "type": "Feature",
+        "properties": {"name": name, "population-density": density, "land-area": "1"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+        },
+    }
+
+
+class TestFailedLoadsAreRetried:
+    """Regression: a failed read was cached for the life of the process, so
+    one transient error left every later run with no exposure at all."""
+
+    def test_boundaries_that_appear_later_are_picked_up(self, tmp_path):
+        path = tmp_path / "late.geojson"
+        assert load_barangays(path) == ()
+
+        path.write_text(
+            json.dumps({"type": "FeatureCollection", "features": [square("Late", "100")]}),
+            encoding="utf-8",
+        )
+        assert [b.name for b in load_barangays(path)] == ["Late"]
+
+    def test_a_successful_load_is_cached(self, tmp_path):
+        path = tmp_path / "once.geojson"
+        path.write_text(
+            json.dumps({"type": "FeatureCollection", "features": [square("Once", "100")]}),
+            encoding="utf-8",
+        )
+        first = load_barangays(path)
+        path.unlink()
+        assert load_barangays(path) is first
+
+    def test_the_exposure_scale_is_not_stuck_at_zero(self, monkeypatch):
+        real = exposure.load_barangays()
+        monkeypatch.setattr(exposure, "_highest", None)
+        monkeypatch.setattr(exposure, "load_barangays", lambda: ())
+        assert exposure._highest_density() == 0.0
+
+        monkeypatch.setattr(exposure, "load_barangays", lambda: real)
+        assert exposure._highest_density() == max(b.density for b in real if b.density)
 
 
 class TestLookup:
