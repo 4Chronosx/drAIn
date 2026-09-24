@@ -47,6 +47,10 @@ class Settings:
     #: result is close to a megabyte, so they cannot be kept forever.
     result_retention_seconds: int = 900
 
+    #: A run takes minutes. One still going after this is not coming back,
+    #: and is failed so it stops holding a queue slot.
+    max_runtime_seconds: int = 1800
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -56,6 +60,7 @@ class Settings:
             max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
             max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
             result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
+            max_runtime_seconds=int(os.getenv("MAX_RUNTIME_SECONDS", "1800")),
         )
 
 

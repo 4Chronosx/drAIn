@@ -128,14 +128,20 @@ class Exposure:
 UNKNOWN_EXPOSURE = Exposure(barangay=None, density=None, score=0.5)
 
 
+@lru_cache(maxsize=1)
+def _highest_density() -> float:
+    """The densest barangay, which exposure is scaled against."""
+    densities = [b.density for b in load_barangays() if b.density is not None]
+    return max(densities) if densities else 0.0
+
+
 def exposure_for(point: tuple[float, float]) -> Exposure:
     """Population exposure at a longitude/latitude."""
     barangay = barangay_at(point)
     if barangay is None or barangay.density is None:
         return UNKNOWN_EXPOSURE
 
-    densities = [b.density for b in load_barangays() if b.density is not None]
-    highest = max(densities) if densities else 0.0
+    highest = _highest_density()
     score = barangay.density / highest if highest > 0 else 0.5
 
     return Exposure(barangay=barangay.name, density=barangay.density, score=score)

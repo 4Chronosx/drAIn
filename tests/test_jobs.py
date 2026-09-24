@@ -125,3 +125,73 @@ def test_submit_and_wait_surfaces_failures_as_a_failed_job(store):
     job = store.submit_and_wait(explode)
     assert job.status is JobStatus.FAILED
     assert job.result is None
+
+
+class TestAbandonedJobs:
+    """A job stuck RUNNING holds its queue slot until the process restarts.
+
+    Only finished jobs are reaped, so anything that leaves a job in RUNNING
+    -- a hung worker, or a BaseException that skipped the handler -- used to
+    consume a slot permanently.
+    """
+
+    def test_a_job_running_too_long_is_failed(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(seconds=-1),
+        )
+        release = threading.Event()
+        try:
+            job = store.submit(lambda: (release.wait(5), {})[1])
+            # Any lookup reaps first.
+            for _ in range(200):
+                current = store.get(job.id)
+                if current is not None and current.status is JobStatus.FAILED:
+                    break
+                threading.Event().wait(0.01)
+            current = store.get(job.id)
+            assert current is not None
+            assert current.status is JobStatus.FAILED
+            assert "did not finish in time" in current.error
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_an_abandoned_job_frees_its_queue_slot(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=1,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(seconds=-1),
+        )
+        release = threading.Event()
+        try:
+            store.submit(lambda: (release.wait(5), {})[1])
+            # The slot is occupied, but the occupant is past its limit, so
+            # the next submission is accepted rather than rejected.
+            for _ in range(200):
+                try:
+                    store.submit(lambda: {})
+                    break
+                except QueueFullError:
+                    threading.Event().wait(0.01)
+            else:
+                raise AssertionError("the queue never freed the abandoned slot")
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_base_exception_still_finishes_the_job(self):
+        store = JobStore(max_workers=1, max_queued=2, retention=timedelta(minutes=5))
+        try:
+
+            def explode():
+                raise MemoryError("out of memory")
+
+            job = wait_for(store.submit(explode), store)
+            assert job.status is JobStatus.FAILED
+            assert "out of memory" in job.error
+        finally:
+            store.shutdown()

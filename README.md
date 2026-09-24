@@ -200,6 +200,7 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
 | `RESULT_RETENTION_SECONDS` | `900` | How long a finished result stays pollable |
+| `MAX_RUNTIME_SECONDS` | `1800` | A run still going after this is failed and its queue slot freed |
 
 
 

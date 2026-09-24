@@ -74,12 +74,14 @@ class JobStore:
         max_workers: int,
         max_queued: int,
         retention: timedelta,
+        max_runtime: timedelta = timedelta(minutes=30),
     ) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="simulation"
         )
         self._max_queued = max_queued
         self._retention = retention
+        self._max_runtime = max_runtime
         self._jobs: dict[str, SimulationJob] = {}
         self._lock = threading.Lock()
 
@@ -132,12 +134,17 @@ class JobStore:
 
         try:
             result = work()
-        except Exception as error:
+        except BaseException as error:
+            # BaseException, not Exception: anything that leaves a job stuck
+            # in RUNNING holds a queue slot for the life of the process,
+            # because only finished jobs are ever reaped.
             with self._lock:
                 job.status = JobStatus.FAILED
                 job.finished_at = _now()
                 job.error = str(error) or error.__class__.__name__
             logger.exception("Simulation %s failed", job.id)
+            if isinstance(error, KeyboardInterrupt | SystemExit):
+                raise
             return
 
         with self._lock:
@@ -151,8 +158,26 @@ class JobStore:
         )
 
     def _drop_expired(self) -> None:
-        """Forget finished jobs past their retention. Caller holds the lock."""
-        cutoff = _now() - self._retention
+        """Reap finished and abandoned jobs. Caller holds the lock."""
+        now = _now()
+
+        # A job still running long past any plausible simulation is not
+        # coming back -- the worker hung, or died without unwinding. Left
+        # alone it would hold its queue slot for the life of the process.
+        abandoned = [
+            job
+            for job in self._jobs.values()
+            if job.status is JobStatus.RUNNING
+            and job.started_at is not None
+            and now - job.started_at > self._max_runtime
+        ]
+        for job in abandoned:
+            job.status = JobStatus.FAILED
+            job.finished_at = now
+            job.error = "The simulation did not finish in time and was abandoned."
+            logger.error("Simulation %s exceeded %s; abandoned", job.id, self._max_runtime)
+
+        cutoff = now - self._retention
         expired = [
             job_id
             for job_id, job in self._jobs.items()

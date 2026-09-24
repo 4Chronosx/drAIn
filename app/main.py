@@ -31,6 +31,7 @@ def _build_job_store(config: Settings) -> JobStore:
         max_workers=config.max_concurrent_simulations,
         max_queued=config.max_queued_simulations,
         retention=timedelta(seconds=config.result_retention_seconds),
+        max_runtime=timedelta(seconds=config.max_runtime_seconds),
     )
 
 
