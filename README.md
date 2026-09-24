@@ -52,7 +52,7 @@ Urban flood modeling typically requires specialized software and technical exper
 #### ⚙️ Core Capabilities
 
 * 🌊 **SWMM Simulation Engine**: Python-based hydraulic and hydrological modeling using PySWMM
-* 🚀 **High-Performance API**: FastAPI endpoints optimized for concurrent simulation requests
+* 🚀 **Queued API**: FastAPI endpoints that queue simulations and let clients poll for results; runs execute one at a time by default
 * 📊 **Data Pipeline**: Automated preprocessing of raw drainage data for SWMM inputs
 * 🔄 **Scenario Management**: Support for multiple rainfall scenarios and infrastructure configurations
 * 📈 **Result Analytics**: Post-processing of simulation outputs for flood hazard ranking
@@ -249,11 +249,13 @@ A SWMM run takes roughly two minutes — longer than browsers and platform
 proxies keep a request open — so simulations are **queued and polled**.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
-  and where to poll. Returns `429` when too much work is already outstanding.
+  and where to poll. Returns `429` when too much work is already outstanding,
+  and `503` while the server is shutting down.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
   succeeds. Returns `404` once the result has expired.
-- `GET /health` — liveness probe; also reports whether hazard scoring
-  is available.
+- `GET /health` — liveness probe. `vulnerability_model_loaded` says whether
+  the legacy k-means model loaded, which only the `Legacy_Cluster_*` fields
+  use; hazard, exposure and risk scoring work without it.
 - `POST /run-simulation` — **deprecated.** Runs the simulation and waits for
   it, holding the request open for the whole run. Kept only so a frontend
   deployed before the queued endpoints keeps working; remove it once no

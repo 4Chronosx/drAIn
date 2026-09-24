@@ -101,4 +101,7 @@ class JobState(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    #: Whether the legacy k-means model loaded. It feeds only the
+    #: Legacy_Cluster_* fields; hazard and risk scoring do not use it. The
+    #: name is kept because it is part of the response contract.
     vulnerability_model_loaded: bool
