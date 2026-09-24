@@ -9,7 +9,6 @@ an unmodified run, clobber the committed baseline artifacts.
 from __future__ import annotations
 
 import logging
-import math
 import shutil
 import tempfile
 from collections.abc import Iterator, Mapping
@@ -88,9 +87,12 @@ def _apply_link_overrides(sim: Simulation, overrides: Mapping[str, Mapping[str, 
 
 
 def _end_time_tokens(duration_hr: float) -> tuple[str, str]:
-    """Return the ``END_TIME``/``END_DATE`` values for a storm of this length."""
-    hours = math.floor(duration_hr)
-    minutes = round((duration_hr - hours) * 60)
+    """Return the ``END_TIME``/``END_DATE`` values for a storm of this length.
+
+    Rounded to the whole minute first and split afterwards. Rounding the
+    minutes on their own turned 1.999 h into "01:60:00".
+    """
+    hours, minutes = divmod(round(duration_hr * 60), 60)
     return f"{hours:02d}:{minutes:02d}:00", SIMULATION_START_DATE
 
 
