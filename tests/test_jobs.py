@@ -195,3 +195,61 @@ class TestAbandonedJobs:
             assert "out of memory" in job.error
         finally:
             store.shutdown()
+
+
+class TestLateResults:
+    """Regression: a job that returned after being timed out flipped to
+    SUCCEEDED and kept the timeout message in ``error``."""
+
+    def test_a_late_success_does_not_overwrite_a_timeout(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=100),
+        )
+        release = threading.Event()
+        returned = threading.Event()
+
+        def slow():
+            release.wait(10)
+            returned.set()
+            return {"late": True}
+
+        try:
+            job = wait_for(store.submit(slow), store)
+            assert job.status is JobStatus.FAILED
+
+            release.set()
+            assert returned.wait(5)
+            threading.Event().wait(0.1)
+
+            after = store.get(job.id)
+            assert after.status is JobStatus.FAILED
+            assert after.result is None
+            assert "did not finish in time" in after.error
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_late_failure_does_not_overwrite_a_timeout(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=100),
+        )
+        release = threading.Event()
+
+        def slow():
+            release.wait(10)
+            raise RuntimeError("late failure")
+
+        try:
+            job = wait_for(store.submit(slow), store)
+            release.set()
+            threading.Event().wait(0.2)
+            assert "did not finish in time" in store.get(job.id).error
+        finally:
+            release.set()
+            store.shutdown()

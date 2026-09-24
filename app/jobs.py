@@ -139,23 +139,49 @@ class JobStore:
             # in RUNNING holds a queue slot for the life of the process,
             # because only finished jobs are ever reaped.
             with self._lock:
-                job.status = JobStatus.FAILED
-                job.finished_at = _now()
-                job.error = str(error) or error.__class__.__name__
-            logger.exception("Simulation %s failed", job.id)
+                recorded = self._finish(job, error=str(error) or error.__class__.__name__)
+            if recorded:
+                logger.exception("Simulation %s failed", job.id)
+            else:
+                logger.warning("Simulation %s failed after it was abandoned: %s", job.id, error)
             if isinstance(error, KeyboardInterrupt | SystemExit):
                 raise
             return
 
         with self._lock:
-            job.status = JobStatus.SUCCEEDED
-            job.finished_at = _now()
-            job.result = result
-        logger.info(
-            "Simulation %s finished in %.1fs",
-            job.id,
-            (job.finished_at - job.started_at).total_seconds(),
-        )
+            recorded = self._finish(job, result=result)
+            elapsed = (_now() - job.started_at).total_seconds() if job.started_at else 0.0
+        if recorded:
+            logger.info("Simulation %s finished in %.1fs", job.id, elapsed)
+        else:
+            logger.warning(
+                "Simulation %s returned after %.1fs, but was already abandoned; "
+                "discarding its result",
+                job.id,
+                elapsed,
+            )
+
+    def _finish(
+        self,
+        job: SimulationJob,
+        *,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Record a job's outcome, unless it already has one. Caller holds the lock.
+
+        A job can be settled twice: the reaper fails a job that ran too long,
+        and then the thread it abandoned may still return. The first outcome
+        stands, so a poll never sees a timed-out job flip to succeeded.
+        Returns whether this outcome was the one recorded.
+        """
+        if job.is_finished:
+            return False
+        job.status = JobStatus.FAILED if error is not None else JobStatus.SUCCEEDED
+        job.finished_at = _now()
+        job.result = None if error is not None else result
+        job.error = error
+        return True
 
     def _drop_expired(self) -> None:
         """Reap finished and abandoned jobs. Caller holds the lock."""
@@ -172,9 +198,7 @@ class JobStore:
             and now - job.started_at > self._max_runtime
         ]
         for job in abandoned:
-            job.status = JobStatus.FAILED
-            job.finished_at = now
-            job.error = "The simulation did not finish in time and was abandoned."
+            self._finish(job, error="The simulation did not finish in time and was abandoned.")
             logger.error("Simulation %s exceeded %s; abandoned", job.id, self._max_runtime)
 
         cutoff = now - self._retention
