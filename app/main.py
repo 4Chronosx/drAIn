@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Settings, settings
-from app.jobs import JobStore, QueueFullError, SimulationJob
+from app.jobs import JobStatus, JobStore, JobStoreClosedError, QueueFullError, SimulationJob
 from app.logging_config import configure_logging
 from app.schemas import HealthResponse, JobAccepted, JobState, SimulationRequest
 from drain.flooding import build_flooding_summary
@@ -62,6 +62,26 @@ def _as_state(job: SimulationJob) -> JobState:
         finished_at=job.finished_at,
         result=job.result,
         error=job.error,
+    )
+
+
+def _queue_full(error: QueueFullError) -> HTTPException:
+    logger.warning("Rejected simulation: %s", error)
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=str(error),
+        headers={"Retry-After": str(POLL_INTERVAL_SECONDS)},
+    )
+
+
+def _shutting_down(error: JobStoreClosedError) -> HTTPException:
+    # Only seen while the process is stopping. A client that retries will
+    # reach the replacement instance.
+    logger.warning("Rejected simulation: %s", error)
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=str(error),
+        headers={"Retry-After": str(POLL_INTERVAL_SECONDS)},
     )
 
 
@@ -118,17 +138,15 @@ def create_app(config: Settings = settings) -> FastAPI:
         and platform proxies keep a request open -- so the result is
         collected from ``GET /simulations/{job_id}``.
 
-        Returns 429 when too much work is already outstanding.
+        Returns 429 when too much work is already outstanding, and 503 while
+        the server is shutting down.
         """
         try:
             job = jobs.submit(lambda: _simulate(request))
         except QueueFullError as error:
-            logger.warning("Rejected simulation: %s", error)
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=str(error),
-                headers={"Retry-After": str(POLL_INTERVAL_SECONDS)},
-            ) from None
+            raise _queue_full(error) from None
+        except JobStoreClosedError as error:
+            raise _shutting_down(error) from None
 
         poll_url = f"/simulations/{job.id}"
         response.headers["Location"] = poll_url
@@ -167,16 +185,17 @@ def create_app(config: Settings = settings) -> FastAPI:
         try:
             job = jobs.submit_and_wait(lambda: _simulate(request))
         except QueueFullError as error:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=str(error),
-                headers={"Retry-After": str(POLL_INTERVAL_SECONDS)},
-            ) from None
+            raise _queue_full(error) from None
+        except JobStoreClosedError as error:
+            raise _shutting_down(error) from None
 
-        if job.result is None:
+        # submit_and_wait always hands back a finished job: a crash, a
+        # timeout or a shutdown arrives as FAILED with a message, which is
+        # the same text GET /simulations/{id} would show.
+        if job.status is not JobStatus.SUCCEEDED or job.result is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Simulation failed.",
+                detail=job.error or "Simulation failed.",
             )
         return job.result
 

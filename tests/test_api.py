@@ -102,6 +102,29 @@ def test_a_failing_simulation_returns_an_error_status(client, monkeypatch):
     assert "nodes_list" not in response.json()
 
 
+def test_a_failing_sync_simulation_says_why(client, monkeypatch):
+    """Regression: the synchronous endpoint dropped the job's error and
+    always answered a bare 'Simulation failed.'"""
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("SWMM exploded")
+
+    monkeypatch.setattr("app.main.run_simulation", explode)
+    response = client.post("/run-simulation", json={})
+    assert response.status_code == 500
+    assert "SWMM exploded" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", ["/simulations", "/run-simulation"])
+def test_a_request_during_shutdown_is_a_503_not_a_crash(path):
+    app = create_app(settings)
+    with TestClient(app):
+        pass  # leaving the block runs shutdown, which closes the job store
+    response = TestClient(app).post(path, json={})
+    assert response.status_code == 503
+    assert int(response.headers["retry-after"]) > 0
+
+
 def poll_until_finished(client, poll_url, timeout=60.0):
     """Poll a queued simulation the way a client would."""
     deadline = time.monotonic() + timeout
