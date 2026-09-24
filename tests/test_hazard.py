@@ -96,3 +96,26 @@ class TestCategories:
         scores = [0.0, 0.05, 0.2, 0.3, 0.45, 0.6, 0.99]
         ranks = [rank[categorise(s)] for s in scores]
         assert ranks == sorted(ranks)
+
+
+class TestTheSentinelDoesNotEscape:
+    """9999 is an internal marker, not a measurement."""
+
+    def test_the_payload_reports_null_for_a_node_that_never_overflowed(self):
+        from drain.flooding import build_flooding_summary
+        from drain.paths import BASE_OUT, BASE_RPT
+
+        rows = build_flooding_summary(BASE_RPT, BASE_OUT)["nodes_list"]
+        assert not [r for r in rows if r["Time_After_Raining_min"] == 9999]
+        assert [r for r in rows if r["Time_After_Raining_min"] is None]
+
+    def test_a_node_that_did_overflow_keeps_its_timing(self):
+        from drain.flooding import build_flooding_summary
+        from drain.paths import BASE_OUT, BASE_RPT
+
+        rows = build_flooding_summary(BASE_RPT, BASE_OUT)["nodes_list"]
+        measured = [
+            r["Time_After_Raining_min"] for r in rows if r["Time_After_Raining_min"] is not None
+        ]
+        assert measured
+        assert all(0 <= value < 9999 for value in measured)

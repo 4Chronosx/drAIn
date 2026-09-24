@@ -14,6 +14,7 @@ import sys
 
 from app.logging_config import configure_logging
 from drain.flooding import build_flooding_summary
+from drain.hazard import DEFAULT_EVENT_HOURS
 from drain.swmm_runner import run_simulation
 
 logger = logging.getLogger(__name__)
@@ -50,8 +51,10 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
 
+    event_hours = float(rainfall.get("duration_hr") or DEFAULT_EVENT_HOURS)
+
     with run_simulation(rainfall=rainfall) as (rpt_path, out_path):
-        summary = build_flooding_summary(rpt_path, out_path)
+        summary = build_flooding_summary(rpt_path, out_path, event_hours=event_hours)
 
     metadata = summary["metadata"]
     print(

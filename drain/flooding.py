@@ -128,7 +128,14 @@ def build_flooding_summary(
             "Time_of_Max_days": summary.time_of_max_days,
             "Time_of_Max_hr_min": summary.time_of_max_minutes,
             "Total_Flood_Volume_10e6_ltr": summary.total_flood_volume,
-            "Time_After_Raining_min": feature.time_after_raining_min,
+            # null, not the sentinel. 9999 is an internal marker for "never
+            # overflowed"; served as-is it reads as a measurement, and the
+            # results table showed "9,999" for three quarters of all nodes.
+            "Time_After_Raining_min": (
+                None
+                if feature.time_after_raining_min >= NO_OVERFLOW_MINUTES
+                else feature.time_after_raining_min
+            ),
             # Hazard: how badly this node floods. Transparent and monotonic.
             "Vulnerability_Category": hazard.category,
             "Vulnerability_Score": hazard.score,

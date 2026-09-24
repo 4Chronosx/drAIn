@@ -15,6 +15,7 @@ from app.jobs import JobStore, QueueFullError, SimulationJob
 from app.logging_config import configure_logging
 from app.schemas import HealthResponse, JobAccepted, JobState, SimulationRequest
 from drain.flooding import build_flooding_summary
+from drain.hazard import DEFAULT_EVENT_HOURS
 from drain.swmm_runner import run_simulation
 from drain.vulnerability import load_model
 
@@ -35,12 +36,19 @@ def _build_job_store(config: Settings) -> JobStore:
 
 def _simulate(request: SimulationRequest) -> dict[str, Any]:
     """Run one simulation to completion. Executed on a worker thread."""
+    rainfall = request.rainfall_spec()
+
+    # Hazard scores duration as a share of the event, so the scorer needs
+    # the storm's real length. Without it a 40-minute flood in a one-hour
+    # storm reads as 3% of a day rather than two thirds of the event.
+    event_hours = float(rainfall.get("duration_hr") or DEFAULT_EVENT_HOURS)
+
     with run_simulation(
         nodes=request.node_overrides(),
         links=request.link_overrides(),
-        rainfall=request.rainfall_spec(),
+        rainfall=rainfall,
     ) as (rpt_path, out_path):
-        return build_flooding_summary(rpt_path, out_path)
+        return build_flooding_summary(rpt_path, out_path, event_hours=event_hours)
 
 
 def _as_state(job: SimulationJob) -> JobState:

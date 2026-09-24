@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app, create_app
+from drain.flooding import build_flooding_summary as flooding_summary_for_test
 
 
 @pytest.fixture(scope="module")
@@ -189,6 +190,36 @@ class TestQueuedSimulations:
                 assert int(response.headers["retry-after"]) > 0
         finally:
             release.set()
+
+
+class TestEventDurationReachesTheScorer:
+    """Regression: the scorer took the storm length but nobody passed it.
+
+    Hazard scores duration as a share of the event. The parameter existed
+    and was unit-tested, but neither the API nor the CLI supplied it, so
+    every run was scored against a 24-hour default — a 40-minute flood in a
+    one-hour storm read as 3% of a day instead of two thirds of the event,
+    which demoted nodes a whole category.
+    """
+
+    def test_the_baseline_reports_the_event_length_it_used(self, client):
+        metadata = client.post("/run-simulation", json={}).json()["metadata"]
+        assert metadata["event_hours"] == 24.0
+
+    def test_a_custom_storm_reports_its_own_length(self, client, monkeypatch):
+        captured = {}
+        real = flooding_summary_for_test
+
+        def spy(rpt_path, out_path, *args, **kwargs):
+            captured["event_hours"] = kwargs.get("event_hours")
+            return real(rpt_path, out_path, *args, **kwargs)
+
+        monkeypatch.setattr("app.main.build_flooding_summary", spy)
+        client.post(
+            "/run-simulation",
+            json={"rainfall": {"total_precip": 0, "duration_hr": 2}},
+        )
+        assert captured["event_hours"] == 2.0
 
 
 class TestDeprecatedSyncEndpoint:
