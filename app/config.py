@@ -51,6 +51,11 @@ class Settings:
     #: and is failed so it stops holding a queue slot.
     max_runtime_seconds: int = 1800
 
+    #: A job still waiting to start after this is failed. With one worker
+    #: and a full queue the last job waits behind several runs, so this is
+    #: generous; it is a backstop, not the normal path.
+    max_queue_wait_seconds: int = 3600
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -61,6 +66,7 @@ class Settings:
             max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
             result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
             max_runtime_seconds=int(os.getenv("MAX_RUNTIME_SECONDS", "1800")),
+            max_queue_wait_seconds=int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "3600")),
         )
 
 

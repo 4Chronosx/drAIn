@@ -61,12 +61,39 @@ class QueueFullError(RuntimeError):
     """Raised when too much work is already outstanding to accept more."""
 
 
+class JobStoreClosedError(RuntimeError):
+    """Raised when work is submitted after the store has shut down."""
+
+
+#: How often a synchronous waiter wakes to reap stuck jobs. Nothing else may
+#: be polling, and reaping is what fails a job that hangs or waits too long.
+_WAIT_REAP_SECONDS = 1.0
+
+
+@dataclass(eq=False)
+class _Entry:
+    """A job plus what the store needs to run it and to wake its waiter."""
+
+    job: SimulationJob
+    #: The simulation to run. Dropped once the job starts or finishes, so a
+    #: finished job does not keep its request alive.
+    work: Callable[[], dict[str, Any]] | None
+    done: threading.Event = field(default_factory=threading.Event)
+    future: Future[None] | None = None
+
+
 class JobStore:
     """Runs simulations on a small thread pool and remembers the results.
 
     Finished jobs are kept for ``retention`` so a client that polls slowly
     still sees the outcome, then dropped: each result is close to a megabyte
     of JSON, so holding them indefinitely would leak the process's memory.
+
+    A thread cannot be killed, so a run that hangs keeps its worker. When one
+    passes ``max_runtime`` the store fails it and moves to a fresh pool,
+    taking the jobs still queued with it; the hung thread is left to finish
+    or not on its own, and whatever it returns is ignored. Without that, one
+    hung run held the only worker and everything behind it waited forever.
     """
 
     def __init__(
@@ -75,15 +102,20 @@ class JobStore:
         max_queued: int,
         retention: timedelta,
         max_runtime: timedelta = timedelta(minutes=30),
+        max_queue_wait: timedelta = timedelta(hours=1),
     ) -> None:
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="simulation"
-        )
+        self._max_workers = max_workers
+        self._executor = self._new_executor()
         self._max_queued = max_queued
         self._retention = retention
         self._max_runtime = max_runtime
-        self._jobs: dict[str, SimulationJob] = {}
+        self._max_queue_wait = max_queue_wait
+        self._entries: dict[str, _Entry] = {}
+        self._closed = False
         self._lock = threading.Lock()
+
+    def _new_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="simulation")
 
     def submit(self, work: Callable[[], dict[str, Any]]) -> SimulationJob:
         """Queue a simulation, or raise :class:`QueueFullError`.
@@ -92,7 +124,7 @@ class JobStore:
         burst of requests from growing an unbounded backlog that nobody is
         still waiting on.
         """
-        _, accepted, _ = self._enqueue(work)
+        _, accepted = self._enqueue(work)
         return accepted
 
     def submit_and_wait(self, work: Callable[[], dict[str, Any]]) -> SimulationJob:
@@ -100,31 +132,15 @@ class JobStore:
 
         Only for the deprecated synchronous endpoint. Going through the same
         pool means it shares the worker limit and the queue cap rather than
-        running unbounded alongside the queued ones.
+        running unbounded alongside the queued ones. Always returns a
+        finished job: a timeout or a shutdown fails it rather than raising.
         """
-        job, _, future = self._enqueue(work)
-        future.result()
+        entry, _ = self._enqueue(work)
+        while not entry.done.wait(timeout=_WAIT_REAP_SECONDS):
+            with self._lock:
+                self._drop_expired()
         with self._lock:
-            return replace(job)
-
-    def _enqueue(
-        self, work: Callable[[], dict[str, Any]]
-    ) -> tuple[SimulationJob, SimulationJob, Future[None]]:
-        """Queue work. Returns the live job, a snapshot of it as accepted,
-        and the future running it."""
-        with self._lock:
-            self._drop_expired()
-            outstanding = sum(1 for job in self._jobs.values() if not job.is_finished)
-            if outstanding >= self._max_queued:
-                raise QueueFullError(f"{outstanding} simulations are already queued or running.")
-
-            job = SimulationJob(id=uuid.uuid4().hex)
-            self._jobs[job.id] = job
-            accepted = replace(job)
-
-        future = self._executor.submit(self._run, job, work)
-        logger.info("Queued simulation %s", job.id)
-        return job, accepted, future
+            return replace(entry.job)
 
     def get(self, job_id: str) -> SimulationJob | None:
         """Look a job up, or ``None`` if it never existed or has expired.
@@ -135,11 +151,65 @@ class JobStore:
         """
         with self._lock:
             self._drop_expired()
-            job = self._jobs.get(job_id)
-            return replace(job) if job is not None else None
+            entry = self._entries.get(job_id)
+            return replace(entry.job) if entry is not None else None
 
-    def _run(self, job: SimulationJob, work: Callable[[], dict[str, Any]]) -> None:
+    def outstanding(self) -> int:
+        """How many jobs are queued or running."""
         with self._lock:
+            return self._outstanding()
+
+    def shutdown(self) -> None:
+        """Stop accepting work and fail whatever has not started.
+
+        Jobs already running are left to finish; their threads cannot be
+        stopped. Anyone blocked in :meth:`submit_and_wait` on a queued job
+        gets it back failed instead of an exception.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for entry in self._entries.values():
+                if entry.job.status is JobStatus.QUEUED:
+                    self._finish(entry, error="The server shut down before the simulation ran.")
+            executor = self._executor
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    def _enqueue(self, work: Callable[[], dict[str, Any]]) -> tuple[_Entry, SimulationJob]:
+        """Queue work. Returns its entry and a snapshot of the job as accepted."""
+        with self._lock:
+            if self._closed:
+                raise JobStoreClosedError("The simulation service is shutting down.")
+            self._drop_expired()
+            outstanding = self._outstanding()
+            if outstanding >= self._max_queued:
+                raise QueueFullError(f"{outstanding} simulations are already queued or running.")
+
+            entry = _Entry(job=SimulationJob(id=uuid.uuid4().hex), work=work)
+            self._entries[entry.job.id] = entry
+            accepted = replace(entry.job)
+            self._dispatch(entry)
+
+        logger.info("Queued simulation %s", entry.job.id)
+        return entry, accepted
+
+    def _outstanding(self) -> int:
+        """Caller holds the lock."""
+        return sum(1 for entry in self._entries.values() if not entry.job.is_finished)
+
+    def _dispatch(self, entry: _Entry) -> None:
+        """Hand a queued job to the current pool. Caller holds the lock."""
+        entry.future = self._executor.submit(self._run, entry)
+
+    def _run(self, entry: _Entry) -> None:
+        job = entry.job
+        with self._lock:
+            # A job that timed out in the queue, or was failed by shutdown,
+            # must not run once a worker finally reaches it.
+            if job.status is not JobStatus.QUEUED or entry.work is None:
+                return
+            work, entry.work = entry.work, None
             job.status = JobStatus.RUNNING
             job.started_at = _now()
         logger.info("Running simulation %s", job.id)
@@ -151,7 +221,7 @@ class JobStore:
             # in RUNNING holds a queue slot for the life of the process,
             # because only finished jobs are ever reaped.
             with self._lock:
-                recorded = self._finish(job, error=str(error) or error.__class__.__name__)
+                recorded = self._finish(entry, error=str(error) or error.__class__.__name__)
             if recorded:
                 logger.exception("Simulation %s failed", job.id)
             else:
@@ -161,7 +231,7 @@ class JobStore:
             return
 
         with self._lock:
-            recorded = self._finish(job, result=result)
+            recorded = self._finish(entry, result=result)
             elapsed = (_now() - job.started_at).total_seconds() if job.started_at else 0.0
         if recorded:
             logger.info("Simulation %s finished in %.1fs", job.id, elapsed)
@@ -175,7 +245,7 @@ class JobStore:
 
     def _finish(
         self,
-        job: SimulationJob,
+        entry: _Entry,
         *,
         result: dict[str, Any] | None = None,
         error: str | None = None,
@@ -187,42 +257,89 @@ class JobStore:
         stands, so a poll never sees a timed-out job flip to succeeded.
         Returns whether this outcome was the one recorded.
         """
+        job = entry.job
         if job.is_finished:
             return False
         job.status = JobStatus.FAILED if error is not None else JobStatus.SUCCEEDED
         job.finished_at = _now()
         job.result = None if error is not None else result
         job.error = error
+        entry.work = None
+        if entry.future is not None:
+            # Only takes effect while the job is still waiting for a worker.
+            entry.future.cancel()
+        entry.done.set()
         return True
 
     def _drop_expired(self) -> None:
         """Reap finished and abandoned jobs. Caller holds the lock."""
         now = _now()
 
+        # A job left waiting this long is behind work that is not moving, or
+        # has outlived any caller still polling for it.
+        stale = [
+            entry
+            for entry in self._entries.values()
+            if entry.job.status is JobStatus.QUEUED
+            and now - entry.job.created_at > self._max_queue_wait
+        ]
+        for entry in stale:
+            self._finish(
+                entry, error="The simulation waited too long in the queue and was dropped."
+            )
+            logger.error(
+                "Simulation %s waited more than %s to start; dropped",
+                entry.job.id,
+                self._max_queue_wait,
+            )
+
         # A job still running long past any plausible simulation is not
         # coming back -- the worker hung, or died without unwinding. Left
         # alone it would hold its queue slot for the life of the process.
         abandoned = [
-            job
-            for job in self._jobs.values()
-            if job.status is JobStatus.RUNNING
-            and job.started_at is not None
-            and now - job.started_at > self._max_runtime
+            entry
+            for entry in self._entries.values()
+            if entry.job.status is JobStatus.RUNNING
+            and entry.job.started_at is not None
+            and now - entry.job.started_at > self._max_runtime
         ]
-        for job in abandoned:
-            self._finish(job, error="The simulation did not finish in time and was abandoned.")
-            logger.error("Simulation %s exceeded %s; abandoned", job.id, self._max_runtime)
+        for entry in abandoned:
+            self._finish(entry, error="The simulation did not finish in time and was abandoned.")
+            logger.error("Simulation %s exceeded %s; abandoned", entry.job.id, self._max_runtime)
+        if abandoned and not self._closed:
+            self._replace_executor()
 
         cutoff = now - self._retention
         expired = [
             job_id
-            for job_id, job in self._jobs.items()
-            if job.finished_at is not None and job.finished_at < cutoff
+            for job_id, entry in self._entries.items()
+            if entry.job.finished_at is not None and entry.job.finished_at < cutoff
         ]
         for job_id in expired:
-            del self._jobs[job_id]
+            del self._entries[job_id]
         if expired:
             logger.debug("Dropped %d expired simulation results", len(expired))
 
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    def _replace_executor(self) -> None:
+        """Move queued work to a fresh pool. Caller holds the lock.
+
+        The abandoned thread still occupies a worker in the old pool, and
+        would keep every job queued there from ever starting. A job the old
+        pool has already begun cannot be cancelled and is left to run there.
+        """
+        old = self._executor
+        self._executor = self._new_executor()
+        moved = 0
+        for entry in self._entries.values():
+            if (
+                entry.job.status is JobStatus.QUEUED
+                and entry.future is not None
+                and entry.future.cancel()
+            ):
+                self._dispatch(entry)
+                moved += 1
+        old.shutdown(wait=False)
+        logger.warning(
+            "Replaced the simulation pool after a run was abandoned; moved %d queued job(s)",
+            moved,
+        )

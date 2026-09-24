@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import pytest
 
-from app.jobs import JobStatus, JobStore, QueueFullError
+from app.jobs import JobStatus, JobStore, JobStoreClosedError, QueueFullError
 
 
 @pytest.fixture
@@ -72,9 +72,15 @@ def test_unknown_jobs_are_not_found(store):
     assert store.get("nope") is None
 
 
-def test_jobs_get_distinct_ids(store):
-    ids = {store.submit(lambda: {}).id for _ in range(5)}
-    assert len(ids) == 5
+def test_jobs_get_distinct_ids():
+    # The cap is set above the burst: this is about ids, and whether the
+    # first jobs finish before the fifth is submitted is down to scheduling.
+    store = JobStore(max_workers=2, max_queued=5, retention=timedelta(minutes=5))
+    try:
+        ids = {store.submit(lambda: {}).id for _ in range(5)}
+        assert len(ids) == 5
+    finally:
+        store.shutdown()
 
 
 def test_the_queue_refuses_more_than_its_cap():
@@ -306,3 +312,168 @@ class TestSnapshots:
 
         job = wait_for(store.submit(work), store)
         assert (job.result is None) != (job.error is None)
+
+
+class TestAStuckJobDoesNotStallTheQueue:
+    """Regression: timing out a hung job used to free nothing but its slot.
+
+    The hung thread still held the only worker, so every job behind it
+    stayed QUEUED forever, was never reaped (only RUNNING jobs were), and
+    once the cap filled every new submission got 429.
+    """
+
+    def test_work_queued_behind_a_timed_out_job_still_runs(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=200),
+        )
+        release = threading.Event()
+        try:
+            stuck = store.submit(hang_until(release))
+            wait_until(lambda: store.get(stuck.id).status is not JobStatus.QUEUED)
+            behind = store.submit(lambda: {"ok": True})
+
+            finished = wait_for(behind, store)
+            assert finished.status is JobStatus.SUCCEEDED
+            assert finished.result == {"ok": True}
+            assert store.get(stuck.id).status is JobStatus.FAILED
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_new_work_runs_after_a_job_times_out(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=200),
+        )
+        release = threading.Event()
+        try:
+            wait_for(store.submit(hang_until(release)), store)
+            assert wait_for(store.submit(lambda: {"ok": True}), store).result == {"ok": True}
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_job_that_waits_in_the_queue_too_long_is_failed(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(minutes=5),
+            max_queue_wait=timedelta(milliseconds=100),
+        )
+        release = threading.Event()
+        ran = threading.Event()
+
+        def record_run():
+            ran.set()
+            return {}
+
+        try:
+            store.submit(hang_until(release))
+            waiting = store.submit(record_run)
+
+            finished = wait_for(waiting, store)
+            assert finished.status is JobStatus.FAILED
+            assert "waited too long" in finished.error
+            assert finished.result is None
+
+            # Once the worker frees up, the expired job must not run anyway.
+            release.set()
+            assert not ran.wait(0.3)
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_job_within_its_time_limits_is_not_reaped(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(minutes=5),
+            max_queue_wait=timedelta(minutes=5),
+        )
+        release = threading.Event()
+        try:
+            running = store.submit(hang_until(release, {"ok": 1}))
+            queued = store.submit(lambda: {"ok": 2})
+            wait_until(lambda: store.get(running.id).status is JobStatus.RUNNING)
+            threading.Event().wait(0.1)
+
+            assert store.get(running.id).status is JobStatus.RUNNING
+            assert store.get(queued.id).status is JobStatus.QUEUED
+            release.set()
+            assert wait_for(running, store).status is JobStatus.SUCCEEDED
+            assert wait_for(queued, store).status is JobStatus.SUCCEEDED
+        finally:
+            release.set()
+            store.shutdown()
+
+
+class TestShutdown:
+    def test_submitting_after_shutdown_is_refused_cleanly(self):
+        store = JobStore(max_workers=1, max_queued=4, retention=timedelta(minutes=5))
+        store.shutdown()
+        with pytest.raises(JobStoreClosedError):
+            store.submit(lambda: {})
+        with pytest.raises(JobStoreClosedError):
+            store.submit_and_wait(lambda: {})
+
+    def test_a_refused_submission_leaves_no_orphan_job(self):
+        store = JobStore(max_workers=1, max_queued=1, retention=timedelta(minutes=5))
+        store.shutdown()
+        with pytest.raises(JobStoreClosedError):
+            store.submit(lambda: {})
+        # Had the refused job been recorded, it would hold the only slot.
+        assert store.outstanding() == 0
+
+    def test_shutdown_fails_queued_jobs_instead_of_leaving_them_queued(self):
+        store = JobStore(max_workers=1, max_queued=4, retention=timedelta(minutes=5))
+        release = threading.Event()
+        ran = threading.Event()
+
+        def record_run():
+            ran.set()
+            return {}
+
+        try:
+            store.submit(hang_until(release))
+            queued = store.submit(record_run)
+            store.shutdown()
+
+            after = store.get(queued.id)
+            assert after.status is JobStatus.FAILED
+            assert "shut down" in after.error
+            release.set()
+            assert not ran.wait(0.3)
+        finally:
+            release.set()
+
+    def test_a_synchronous_waiter_gets_a_failed_job_on_shutdown(self):
+        """Regression: the waiter used to get CancelledError, a bare 500."""
+        store = JobStore(max_workers=1, max_queued=4, retention=timedelta(minutes=5))
+        release = threading.Event()
+        outcome = {}
+
+        def wait_in_background():
+            try:
+                outcome["job"] = store.submit_and_wait(lambda: {"ok": True})
+            except BaseException as error:
+                outcome["error"] = error
+
+        try:
+            store.submit(hang_until(release))
+            waiter = threading.Thread(target=wait_in_background)
+            waiter.start()
+            wait_until(lambda: store.outstanding() == 2)
+            store.shutdown()
+            waiter.join(5)
+
+            assert "error" not in outcome, outcome.get("error")
+            assert outcome["job"].status is JobStatus.FAILED
+        finally:
+            release.set()

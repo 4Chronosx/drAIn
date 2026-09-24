@@ -191,6 +191,56 @@ class TestQueuedSimulations:
         finally:
             release.set()
 
+    def test_a_finished_job_stops_asking_to_be_polled(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        poll_until_finished(client, poll_url)
+        assert "retry-after" not in client.get(poll_url).headers
+
+    def test_polling_a_timed_out_job_reports_it_failed(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = create_app(replace(settings, max_runtime_seconds=0))
+        try:
+            with TestClient(app) as slow_client:
+                poll_url = slow_client.post("/simulations", json={}).json()["poll_url"]
+                finished = poll_until_finished(slow_client, poll_url, timeout=10)
+                assert finished["status"] == "failed"
+                assert finished["result"] is None
+                assert "did not finish in time" in finished["error"]
+        finally:
+            release.set()
+
+    def test_a_hung_run_does_not_block_the_jobs_behind_it(self, monkeypatch):
+        """Regression: one hung run held the only worker, so every later job
+        stayed queued until the cap filled and everything got 429."""
+        release = threading.Event()
+        calls = []
+
+        def first_hangs(request):
+            calls.append(request)
+            if len(calls) == 1:
+                release.wait(10)
+            return {"run": len(calls)}
+
+        monkeypatch.setattr("app.main._simulate", first_hangs)
+        app = create_app(
+            replace(
+                settings,
+                max_concurrent_simulations=1,
+                max_queued_simulations=2,
+                # Long enough that the second, quick run is not also reaped.
+                max_runtime_seconds=1,
+            )
+        )
+        try:
+            with TestClient(app) as slow_client:
+                slow_client.post("/simulations", json={})
+                behind = slow_client.post("/simulations", json={}).json()["poll_url"]
+                finished = poll_until_finished(slow_client, behind, timeout=10)
+                assert finished["status"] == "succeeded"
+        finally:
+            release.set()
+
 
 class TestEventDurationReachesTheScorer:
     """Regression: the scorer took the storm length but nobody passed it.
