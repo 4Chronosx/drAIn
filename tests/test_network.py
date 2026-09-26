@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from drain.network import node_locations
+from drain.network import link_suffixes, node_ids, node_locations
 
 
 def test_every_simulated_node_has_a_location():
@@ -32,3 +32,17 @@ def test_comment_and_header_rows_are_skipped():
     for node_id in node_locations():
         assert not node_id.startswith(";")
         assert not node_id.startswith("[")
+
+
+def test_node_ids_cover_every_junction_and_outfall():
+    ids = node_ids()
+    assert len(ids) == 1413
+    assert {"I-4", "ISD-1"} <= ids
+    assert ids == set(node_locations())
+
+
+def test_link_suffixes_accept_the_pipe_id_and_the_full_name():
+    suffixes = link_suffixes()
+    assert "C-88" in suffixes
+    assert "C_0-C-88" in suffixes
+    assert "" not in suffixes

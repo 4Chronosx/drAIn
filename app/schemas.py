@@ -3,35 +3,65 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from app.jobs import JobStatus
+
+#: Overrides are handed straight to SWMM, which does not check them: a
+#: negative depth or an infinite area either produces nonsense or upsets
+#: the engine. So every value must be a finite number inside a range that
+#: is physically possible for this network, and a misspelt field is an
+#: error rather than silently ignored. The ranges are a little wider than
+#: the app's sliders, not a statement of what is sensible to try.
+_STRICT = ConfigDict(allow_inf_nan=False, extra="forbid")
+
+#: A node or link id, as the network names it (e.g. I-4, C-88).
+ComponentId = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
 
 class NodeOverride(BaseModel):
     """Per-node property overrides applied before the simulation runs."""
 
-    inv_elev: float | None = None
-    init_depth: float | None = None
-    ponding_area: float | None = None
-    surcharge_depth: float | None = None
+    model_config = _STRICT
+
+    # Every node in the shipped network sits between 0.26 m and 41.7 m.
+    inv_elev: float | None = Field(None, ge=0, le=100, description="Invert elevation, m.")
+    # Nodes are 1.2 m deep.
+    init_depth: float | None = Field(None, ge=0, le=10, description="Initial water depth, m.")
+    ponding_area: float | None = Field(None, ge=0, le=10_000, description="Ponded area, m².")
+    surcharge_depth: float | None = Field(
+        None, ge=0, le=10, description="Extra depth before flooding, m."
+    )
 
 
 class LinkOverride(BaseModel):
     """Per-conduit property overrides applied before the simulation runs."""
 
-    init_flow: float | None = None
-    upstrm_offset_depth: float | None = None
-    downstrm_offset_depth: float | None = None
-    avg_conduit_loss: float | None = None
+    model_config = _STRICT
+
+    # Named init_flow on the wire, but it sets the conduit's flow limit.
+    init_flow: float | None = Field(None, ge=0, le=100, description="Flow limit, m³/s.")
+    upstrm_offset_depth: float | None = Field(
+        None, ge=0, le=20, description="Inlet offset above the node invert, m."
+    )
+    downstrm_offset_depth: float | None = Field(
+        None, ge=0, le=20, description="Outlet offset above the node invert, m."
+    )
+    avg_conduit_loss: float | None = Field(
+        None, ge=0, le=100, description="Average minor-loss coefficient."
+    )
 
 
 class RainfallSpec(BaseModel):
     """A design storm, described by its total depth and duration."""
 
-    total_precip: float = Field(ge=0, description="Total rainfall depth in mm.")
+    model_config = _STRICT
+
+    # 2,000 mm is past the heaviest 24 hours ever recorded anywhere; it
+    # only catches nonsense.
+    total_precip: float = Field(ge=0, le=2000, description="Total rainfall depth in mm.")
     # The shipped network runs a 24-hour window. A longer storm would be
     # silently truncated by SWMM, so reject it rather than return results that
     # do not correspond to the request.
@@ -45,8 +75,10 @@ class SimulationRequest(BaseModel):
     unmodified network, whose results are served from the shipped baseline.
     """
 
-    nodes: dict[str, NodeOverride] = Field(default_factory=dict)
-    links: dict[str, LinkOverride] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: dict[ComponentId, NodeOverride] = Field(default_factory=dict)
+    links: dict[ComponentId, LinkOverride] = Field(default_factory=dict)
     rainfall: RainfallSpec | None = None
 
     @model_validator(mode="before")

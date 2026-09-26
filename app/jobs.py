@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,8 @@ class SimulationJob:
     """One queued or completed simulation."""
 
     id: str
+    #: Who asked for it. Only they may read it back.
+    owner: str | None = None
     status: JobStatus = JobStatus.QUEUED
     created_at: datetime = field(default_factory=_now)
     started_at: datetime | None = None
@@ -61,24 +64,26 @@ class QueueFullError(RuntimeError):
     """Raised when too much work is already outstanding to accept more."""
 
 
+class UserLimitError(QueueFullError):
+    """Raised when one person already has as much work as they may have."""
+
+
 class JobStoreClosedError(RuntimeError):
     """Raised when work is submitted after the store has shut down."""
 
 
-#: How often a synchronous waiter wakes to reap stuck jobs. Nothing else may
-#: be polling, and reaping is what fails a job that hangs or waits too long.
-_WAIT_REAP_SECONDS = 1.0
+#: The window the per-person run allowance is counted over.
+_RUN_WINDOW = timedelta(hours=1)
 
 
 @dataclass(eq=False)
 class _Entry:
-    """A job plus what the store needs to run it and to wake its waiter."""
+    """A job plus what the store needs to run it."""
 
     job: SimulationJob
     #: The simulation to run. Dropped once the job starts or finishes, so a
     #: finished job does not keep its request alive.
     work: Callable[[], dict[str, Any]] | None
-    done: threading.Event = field(default_factory=threading.Event)
     future: Future[None] | None = None
 
 
@@ -103,6 +108,8 @@ class JobStore:
         retention: timedelta,
         max_runtime: timedelta = timedelta(minutes=30),
         max_queue_wait: timedelta = timedelta(hours=1),
+        max_jobs_per_owner: int | None = None,
+        max_runs_per_owner_per_hour: int | None = None,
     ) -> None:
         self._max_workers = max_workers
         self._executor = self._new_executor()
@@ -111,36 +118,26 @@ class JobStore:
         self._max_runtime = max_runtime
         self._max_queue_wait = max_queue_wait
         self._entries: dict[str, _Entry] = {}
+        # One slow user shouldn't be able to fill the queue for everyone.
+        self._max_jobs_per_owner = max_jobs_per_owner
+        self._max_runs_per_owner_per_hour = max_runs_per_owner_per_hour
+        self._recent_runs: dict[str, deque[datetime]] = {}
         self._closed = False
         self._lock = threading.Lock()
 
     def _new_executor(self) -> ThreadPoolExecutor:
         return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="simulation")
 
-    def submit(self, work: Callable[[], dict[str, Any]]) -> SimulationJob:
+    def submit(self, work: Callable[[], dict[str, Any]], owner: str | None = None) -> SimulationJob:
         """Queue a simulation, or raise :class:`QueueFullError`.
 
         The cap counts work that has not finished yet. It is what stops a
         burst of requests from growing an unbounded backlog that nobody is
-        still waiting on.
+        still waiting on. An ``owner`` is also held to their own allowance
+        (:class:`UserLimitError`).
         """
-        _, accepted = self._enqueue(work)
+        _, accepted = self._enqueue(work, owner)
         return accepted
-
-    def submit_and_wait(self, work: Callable[[], dict[str, Any]]) -> SimulationJob:
-        """Queue a simulation and block until it finishes.
-
-        Only for the deprecated synchronous endpoint. Going through the same
-        pool means it shares the worker limit and the queue cap rather than
-        running unbounded alongside the queued ones. Always returns a
-        finished job: a timeout or a shutdown fails it rather than raising.
-        """
-        entry, _ = self._enqueue(work)
-        while not entry.done.wait(timeout=_WAIT_REAP_SECONDS):
-            with self._lock:
-                self._drop_expired()
-        with self._lock:
-            return replace(entry.job)
 
     def get(self, job_id: str) -> SimulationJob | None:
         """Look a job up, or ``None`` if it never existed or has expired.
@@ -163,8 +160,7 @@ class JobStore:
         """Stop accepting work and fail whatever has not started.
 
         Jobs already running are left to finish; their threads cannot be
-        stopped. Anyone blocked in :meth:`submit_and_wait` on a queued job
-        gets it back failed instead of an exception.
+        stopped.
         """
         with self._lock:
             if self._closed:
@@ -176,17 +172,23 @@ class JobStore:
             executor = self._executor
         executor.shutdown(wait=False, cancel_futures=True)
 
-    def _enqueue(self, work: Callable[[], dict[str, Any]]) -> tuple[_Entry, SimulationJob]:
+    def _enqueue(
+        self, work: Callable[[], dict[str, Any]], owner: str | None = None
+    ) -> tuple[_Entry, SimulationJob]:
         """Queue work. Returns its entry and a snapshot of the job as accepted."""
         with self._lock:
             if self._closed:
                 raise JobStoreClosedError("The simulation service is shutting down.")
             self._drop_expired()
+            if owner is not None:
+                self._check_owner_allowance(owner)
             outstanding = self._outstanding()
             if outstanding >= self._max_queued:
                 raise QueueFullError(f"{outstanding} simulations are already queued or running.")
 
-            entry = _Entry(job=SimulationJob(id=uuid.uuid4().hex), work=work)
+            entry = _Entry(job=SimulationJob(id=uuid.uuid4().hex, owner=owner), work=work)
+            if owner is not None:
+                self._recent_runs.setdefault(owner, deque()).append(entry.job.created_at)
             self._entries[entry.job.id] = entry
             accepted = replace(entry.job)
             self._dispatch(entry)
@@ -197,6 +199,33 @@ class JobStore:
     def _outstanding(self) -> int:
         """Caller holds the lock."""
         return sum(1 for entry in self._entries.values() if not entry.job.is_finished)
+
+    def _check_owner_allowance(self, owner: str) -> None:
+        """Refuse an owner at their limit. Caller holds the lock."""
+        if self._max_jobs_per_owner is not None:
+            mine = sum(
+                1
+                for entry in self._entries.values()
+                if entry.job.owner == owner and not entry.job.is_finished
+            )
+            if mine >= self._max_jobs_per_owner:
+                raise UserLimitError(
+                    "You already have a simulation queued or running. "
+                    "Wait for it to finish before starting another."
+                )
+
+        if self._max_runs_per_owner_per_hour is not None:
+            recent = self._recent_runs.get(owner)
+            cutoff = _now() - _RUN_WINDOW
+            while recent and recent[0] < cutoff:
+                recent.popleft()
+            if recent is not None and not recent:
+                del self._recent_runs[owner]
+            elif recent is not None and len(recent) >= self._max_runs_per_owner_per_hour:
+                raise UserLimitError(
+                    f"You have started {len(recent)} simulations in the past hour, "
+                    "the most allowed. Try again later."
+                )
 
     def _dispatch(self, entry: _Entry) -> None:
         """Hand a queued job to the current pool. Caller holds the lock."""
@@ -268,7 +297,6 @@ class JobStore:
         if entry.future is not None:
             # Only takes effect while the job is still waiting for a worker.
             entry.future.cancel()
-        entry.done.set()
         return True
 
     def _drop_expired(self) -> None:

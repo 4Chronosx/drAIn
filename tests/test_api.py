@@ -9,15 +9,75 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 
+from app.auth import AuthUnavailableError, Caller
 from app.config import settings
-from app.main import app, create_app
+from app.main import create_app
 from drain.flooding import build_flooding_summary as flooding_summary_for_test
+
+#: Two known users; any other token is invalid.
+USERS = {"token-a": Caller("user-a"), "token-b": Caller("user-b")}
+
+
+class FakeAuthenticator:
+    def authenticate(self, token: str) -> Caller | None:
+        return USERS.get(token)
+
+
+class BrokenAuthenticator:
+    def authenticate(self, token: str) -> Caller | None:
+        raise AuthUnavailableError("Supabase is down")
+
+
+#: Generous per-user limits, so tests that queue several runs aren't held
+#: back by them. The tests of the limits set their own.
+TEST_SETTINGS = replace(
+    settings,
+    require_auth=True,
+    max_jobs_per_user=100,
+    max_runs_per_user_per_hour=1000,
+)
+
+AS_A = {"Authorization": "Bearer token-a"}
+AS_B = {"Authorization": "Bearer token-b"}
+
+
+def make_app(authenticator=None, **overrides):
+    return create_app(
+        replace(TEST_SETTINGS, **overrides),
+        authenticator=authenticator or FakeAuthenticator(),
+    )
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as test_client:
+    with TestClient(make_app(), headers=AS_A) as test_client:
         yield test_client
+
+
+def poll_until_finished(client, poll_url, timeout=60.0):
+    """Poll a queued simulation the way a client would."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(poll_url)
+        assert response.status_code == 200
+        body = response.json()
+        if body["status"] in {"succeeded", "failed"}:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"{poll_url} did not finish within {timeout}s")
+
+
+def run(client, payload):
+    """Queue a simulation and wait for it; return the finished job."""
+    response = client.post("/simulations", json=payload)
+    assert response.status_code == 202, response.text
+    return poll_until_finished(client, response.json()["poll_url"])
+
+
+def baseline(client):
+    finished = run(client, {})
+    assert finished["status"] == "succeeded"
+    return finished["result"]
 
 
 def test_health_reports_the_model_is_available(client):
@@ -26,24 +86,26 @@ def test_health_reports_the_model_is_available(client):
     assert body["vulnerability_model_loaded"] is True
 
 
+def test_health_needs_no_sign_in():
+    with TestClient(make_app()) as anonymous:
+        assert anonymous.get("/health").status_code == 200
+
+
 def test_unmodified_request_serves_the_baseline(client):
     """An empty request needs no simulation, so this stays fast."""
-    response = client.post("/run-simulation", json={"nodes": {}, "links": {}, "rainfall": {}})
-    assert response.status_code == 200
-
-    body = response.json()
+    body = baseline(client)
     assert body["metadata"]["total_nodes"] == 1413
     assert body["metadata"]["flooded_nodes"] == 450
     assert len(body["nodes_list"]) == 1413
 
 
 def test_baseline_exposes_the_same_nodes_as_a_list_and_a_dict(client):
-    body = client.post("/run-simulation", json={}).json()
+    body = baseline(client)
     assert {row["Node"] for row in body["nodes_list"]} == set(body["nodes_dict"])
 
 
 def test_node_rows_carry_the_documented_fields(client):
-    body = client.post("/run-simulation", json={}).json()
+    body = baseline(client)
     assert set(body["nodes_dict"]["I-4"]) == {
         # Raw flooding figures from the simulation.
         "Hours_Flooded",
@@ -68,74 +130,149 @@ def test_node_rows_carry_the_documented_fields(client):
 
 
 def test_metadata_does_not_leak_server_paths(client):
-    metadata = client.post("/run-simulation", json={}).json()["metadata"]
+    metadata = baseline(client)["metadata"]
     for key in ("rpt_file", "out_file", "model_file"):
         assert "/" not in metadata[key] and "\\" not in metadata[key]
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"rainfall": {"total_precip": 10, "duration_hr": 48}},  # beyond the 24 h window
-        {"rainfall": {"total_precip": 10, "duration_hr": 0}},  # zero-length storm
-        {"rainfall": {"total_precip": -5, "duration_hr": 2}},  # negative depth
-        {"rainfall": {"total_precip": 10}},  # missing duration
-    ],
-)
-def test_rejects_impossible_storms(client, payload):
-    assert client.post("/run-simulation", json=payload).status_code == 422
-
-
-def test_a_failing_simulation_returns_an_error_status(client, monkeypatch):
-    """Regression: failures used to be swallowed and returned as 200 {}.
-
-    The frontend checks response.ok, so a 200 with no nodes_list surfaced as
-    an unrelated TypeError further down the page.
-    """
-
-    def explode(*args, **kwargs):
-        raise RuntimeError("SWMM exploded")
-
-    monkeypatch.setattr("app.main.run_simulation", explode)
-    response = client.post("/run-simulation", json={})
-    assert response.status_code == 500
-    assert "nodes_list" not in response.json()
-
-
-def test_a_failing_sync_simulation_says_why(client, monkeypatch):
-    """Regression: the synchronous endpoint dropped the job's error and
-    always answered a bare 'Simulation failed.'"""
-
-    def explode(*args, **kwargs):
-        raise RuntimeError("SWMM exploded")
-
-    monkeypatch.setattr("app.main.run_simulation", explode)
-    response = client.post("/run-simulation", json={})
-    assert response.status_code == 500
-    assert "SWMM exploded" in response.json()["detail"]
-
-
-@pytest.mark.parametrize("path", ["/simulations", "/run-simulation"])
-def test_a_request_during_shutdown_is_a_503_not_a_crash(path):
-    app = create_app(settings)
+def test_a_request_during_shutdown_is_a_503_not_a_crash():
+    app = make_app()
     with TestClient(app):
         pass  # leaving the block runs shutdown, which closes the job store
-    response = TestClient(app).post(path, json={})
+    response = TestClient(app).post("/simulations", json={}, headers=AS_A)
     assert response.status_code == 503
     assert int(response.headers["retry-after"]) > 0
 
 
-def poll_until_finished(client, poll_url, timeout=60.0):
-    """Poll a queued simulation the way a client would."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        response = client.get(poll_url)
-        assert response.status_code == 200
-        body = response.json()
-        if body["status"] in {"succeeded", "failed"}:
-            return body
-        time.sleep(0.05)
-    raise AssertionError(f"{poll_url} did not finish within {timeout}s")
+def test_the_deprecated_synchronous_endpoint_is_gone(client):
+    """It held a request open for the whole run and had no sign-in."""
+    assert client.post("/run-simulation", json={}).status_code in {404, 405}
+    assert "/run-simulation" not in client.get("/openapi.json").json()["paths"]
+
+
+class TestSignIn:
+    """Runs cost minutes of CPU, so only signed-in users may start them."""
+
+    def test_no_token_is_a_401(self):
+        with TestClient(make_app()) as anonymous:
+            response = anonymous.post("/simulations", json={})
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_an_unknown_token_is_a_401(self):
+        with TestClient(make_app()) as stranger:
+            response = stranger.post(
+                "/simulations", json={}, headers={"Authorization": "Bearer forged"}
+            )
+        assert response.status_code == 401
+
+    def test_polling_needs_a_sign_in_too(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        assert client.get(poll_url, headers={"Authorization": ""}).status_code == 401
+
+    def test_someone_elses_job_is_not_found(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        assert client.get(poll_url, headers=AS_B).status_code == 404
+
+    def test_a_server_without_auth_settings_refuses_rather_than_opens(self):
+        app = create_app(replace(TEST_SETTINGS, supabase_url=None, supabase_anon_key=None))
+        with TestClient(app) as misconfigured:
+            response = misconfigured.post("/simulations", json={}, headers=AS_A)
+        assert response.status_code == 503
+
+    def test_an_auth_outage_is_a_503(self):
+        with TestClient(make_app(BrokenAuthenticator())) as outage:
+            response = outage.post("/simulations", json={}, headers=AS_A)
+        assert response.status_code == 503
+
+    def test_local_development_can_turn_sign_in_off(self):
+        app = create_app(replace(TEST_SETTINGS, require_auth=False))
+        with TestClient(app) as local:
+            poll_url = local.post("/simulations", json={}).json()["poll_url"]
+            assert poll_until_finished(local, poll_url)["status"] == "succeeded"
+
+
+class TestPerUserLimits:
+    def test_one_run_at_a_time_per_person(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = make_app(max_jobs_per_user=1)
+        try:
+            with TestClient(app) as limited:
+                assert limited.post("/simulations", json={}, headers=AS_A).status_code == 202
+
+                second = limited.post("/simulations", json={}, headers=AS_A)
+                assert second.status_code == 429
+                assert "already have a simulation" in second.json()["detail"]
+                assert int(second.headers["retry-after"]) >= 60
+
+                # Someone else is not held back by it.
+                assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+        finally:
+            release.set()
+
+    def test_an_hourly_allowance_per_person(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        app = make_app(max_runs_per_user_per_hour=2)
+        with TestClient(app, headers=AS_A) as limited:
+            for _ in range(2):
+                poll_url = limited.post("/simulations", json={}).json()["poll_url"]
+                poll_until_finished(limited, poll_url)
+
+            refused = limited.post("/simulations", json={})
+            assert refused.status_code == 429
+            assert "past hour" in refused.json()["detail"]
+            assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+
+
+class TestOverridesAreChecked:
+    """SWMM takes whatever it is given, so the API checks first."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"rainfall": {"total_precip": 10, "duration_hr": 48}},  # beyond the 24 h window
+            {"rainfall": {"total_precip": 10, "duration_hr": 0}},  # zero-length storm
+            {"rainfall": {"total_precip": -5, "duration_hr": 2}},  # negative depth
+            {"rainfall": {"total_precip": 10}},  # missing duration
+            {"rainfall": {"total_precip": 1e9, "duration_hr": 2}},  # absurd depth
+            {"nodes": {"I-4": {"inv_elev": -3}}},  # below the network's datum
+            {"nodes": {"I-4": {"ponding_area": 1e12}}},  # absurd area
+            {"nodes": {"I-4": {"surcharge_depth": -1}}},
+            {"nodes": {"I-4": {"inv_elev": "NaN"}}},  # not a finite number
+            {"nodes": {"I-4": {"invert": 5}}},  # misspelt field
+            {"links": {"C-88": {"init_flow": -1}}},
+            {"links": {"C-88": {"avg_conduit_loss": 1e6}}},
+            {"links": {"": {"init_flow": 1}}},  # an empty id would match every link
+            {"extra": {}},
+        ],
+    )
+    def test_an_impossible_request_is_rejected_before_it_is_queued(self, client, payload):
+        # Validation failures should not cost a queue slot.
+        assert client.post("/simulations", json=payload).status_code == 422
+
+    def test_an_unknown_node_is_rejected_by_name(self, client):
+        response = client.post("/simulations", json={"nodes": {"I-99999": {"inv_elev": 5}}})
+        assert response.status_code == 422
+        assert "I-99999" in response.json()["detail"]
+
+    def test_an_unknown_link_is_rejected_by_name(self, client):
+        response = client.post("/simulations", json={"links": {"C-XYZ": {"init_flow": 1}}})
+        assert response.status_code == 422
+        assert "C-XYZ" in response.json()["detail"]
+
+    def test_real_nodes_and_links_are_accepted(self, client, monkeypatch):
+        seen = []
+        monkeypatch.setattr("app.main._simulate", lambda request: seen.append(request) or {})
+        finished = run(
+            client,
+            {
+                "nodes": {"I-4": {"inv_elev": 16, "init_depth": 0}},
+                "links": {"C-88": {"init_flow": 2.5}},
+            },
+        )
+        assert finished["status"] == "succeeded"
+        assert seen[0].node_overrides() == {"I-4": {"inv_elev": 16.0, "init_depth": 0.0}}
 
 
 class TestQueuedSimulations:
@@ -155,17 +292,8 @@ class TestQueuedSimulations:
         assert response.headers["location"] == response.json()["poll_url"]
         assert int(response.headers["retry-after"]) > 0
 
-    def test_polling_yields_the_same_payload_as_the_sync_endpoint(self, client):
-        poll_url = client.post("/simulations", json={}).json()["poll_url"]
-        finished = poll_until_finished(client, poll_url)
-
-        assert finished["status"] == "succeeded"
-        assert finished["error"] is None
-        assert finished["result"] == client.post("/run-simulation", json={}).json()
-
     def test_a_finished_job_reports_when_it_ran(self, client):
-        poll_url = client.post("/simulations", json={}).json()["poll_url"]
-        finished = poll_until_finished(client, poll_url)
+        finished = run(client, {})
 
         assert finished["created_at"] is not None
         assert finished["started_at"] is not None
@@ -176,24 +304,12 @@ class TestQueuedSimulations:
         assert response.status_code == 404
         assert "expired" in response.json()["detail"]
 
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {"rainfall": {"total_precip": 10, "duration_hr": 48}},
-            {"rainfall": {"total_precip": -5, "duration_hr": 2}},
-        ],
-    )
-    def test_an_impossible_storm_is_rejected_before_it_is_queued(self, client, payload):
-        # Validation failures should not cost a queue slot.
-        assert client.post("/simulations", json=payload).status_code == 422
-
     def test_a_failing_simulation_finishes_as_failed(self, client, monkeypatch):
         def explode(*args, **kwargs):
             raise RuntimeError("SWMM exploded")
 
         monkeypatch.setattr("app.main.run_simulation", explode)
-        poll_url = client.post("/simulations", json={}).json()["poll_url"]
-        finished = poll_until_finished(client, poll_url)
+        finished = run(client, {})
 
         assert finished["status"] == "failed"
         assert finished["result"] is None
@@ -203,12 +319,13 @@ class TestQueuedSimulations:
         # One worker and one slot, held by a simulation that will not return.
         release = threading.Event()
         monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
-        app = create_app(replace(settings, max_concurrent_simulations=1, max_queued_simulations=1))
+        app = make_app(max_concurrent_simulations=1, max_queued_simulations=1)
         try:
             with TestClient(app) as full_client:
-                assert full_client.post("/simulations", json={}).status_code == 202
+                assert full_client.post("/simulations", json={}, headers=AS_A).status_code == 202
 
-                response = full_client.post("/simulations", json={})
+                # A different person, so it is the server's cap that refuses.
+                response = full_client.post("/simulations", json={}, headers=AS_B)
                 assert response.status_code == 429
                 assert int(response.headers["retry-after"]) > 0
         finally:
@@ -222,9 +339,9 @@ class TestQueuedSimulations:
     def test_polling_a_timed_out_job_reports_it_failed(self, monkeypatch):
         release = threading.Event()
         monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
-        app = create_app(replace(settings, max_runtime_seconds=0))
+        app = make_app(max_runtime_seconds=0)
         try:
-            with TestClient(app) as slow_client:
+            with TestClient(app, headers=AS_A) as slow_client:
                 poll_url = slow_client.post("/simulations", json={}).json()["poll_url"]
                 finished = poll_until_finished(slow_client, poll_url, timeout=10)
                 assert finished["status"] == "failed"
@@ -246,17 +363,14 @@ class TestQueuedSimulations:
             return {"run": len(calls)}
 
         monkeypatch.setattr("app.main._simulate", first_hangs)
-        app = create_app(
-            replace(
-                settings,
-                max_concurrent_simulations=1,
-                max_queued_simulations=2,
-                # Long enough that the second, quick run is not also reaped.
-                max_runtime_seconds=1,
-            )
+        app = make_app(
+            max_concurrent_simulations=1,
+            max_queued_simulations=2,
+            # Long enough that the second, quick run is not also reaped.
+            max_runtime_seconds=1,
         )
         try:
-            with TestClient(app) as slow_client:
+            with TestClient(app, headers=AS_A) as slow_client:
                 slow_client.post("/simulations", json={})
                 behind = slow_client.post("/simulations", json={}).json()["poll_url"]
                 finished = poll_until_finished(slow_client, behind, timeout=10)
@@ -276,8 +390,7 @@ class TestEventDurationReachesTheScorer:
     """
 
     def test_the_baseline_reports_the_event_length_it_used(self, client):
-        metadata = client.post("/run-simulation", json={}).json()["metadata"]
-        assert metadata["event_hours"] == 24.0
+        assert baseline(client)["metadata"]["event_hours"] == 24.0
 
     def test_a_custom_storm_reports_its_own_length(self, client, monkeypatch):
         captured = {}
@@ -288,22 +401,8 @@ class TestEventDurationReachesTheScorer:
             return real(rpt_path, out_path, *args, **kwargs)
 
         monkeypatch.setattr("app.main.build_flooding_summary", spy)
-        client.post(
-            "/run-simulation",
-            json={"rainfall": {"total_precip": 0, "duration_hr": 2}},
-        )
+        run(client, {"rainfall": {"total_precip": 0, "duration_hr": 2}})
         assert captured["event_hours"] == 2.0
-
-
-class TestDeprecatedSyncEndpoint:
-    def test_it_still_returns_the_result_directly(self, client):
-        body = client.post("/run-simulation", json={}).json()
-        assert body["metadata"]["total_nodes"] == 1413
-
-    def test_it_is_marked_deprecated_in_the_schema(self, client):
-        schema = client.get("/openapi.json").json()
-        assert schema["paths"]["/run-simulation"]["post"]["deprecated"] is True
-        assert "deprecated" not in schema["paths"]["/simulations"]["post"]
 
 
 def test_browsers_may_read_the_polling_headers(client):

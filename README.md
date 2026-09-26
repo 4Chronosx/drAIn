@@ -202,6 +202,15 @@ All optional; the defaults cover local development and the known deployments.
 | `RESULT_RETENTION_SECONDS` | `900` | How long a finished result stays pollable |
 | `MAX_RUNTIME_SECONDS` | `1800` | A run still going after this is failed, its queue slot freed, and the jobs behind it moved to a fresh worker |
 | `MAX_QUEUE_WAIT_SECONDS` | `3600` | A job still waiting to start after this is failed |
+| `SUPABASE_URL` | unset | The Supabase project the app signs people in with. **Required** unless `REQUIRE_AUTH=false` |
+| `SUPABASE_ANON_KEY` | unset | That project's public (anon / publishable) key, sent when checking a token |
+| `REQUIRE_AUTH` | `true` | Refuse simulations from callers who are not signed in. Turn off only for local development |
+| `MAX_JOBS_PER_USER` | `1` | Runs one person may have queued or running at once |
+| `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
+
+Without `SUPABASE_URL` and `SUPABASE_ANON_KEY` the server refuses every
+simulation with `503` rather than opening them to everyone. To try the API
+locally without a Supabase project, set `REQUIRE_AUTH=false`.
 
 
 
@@ -248,18 +257,23 @@ contract. The user-facing term is "flood hazard".
 A SWMM run takes roughly two minutes — longer than browsers and platform
 proxies keep a request open — so simulations are **queued and polled**.
 
+**Sign-in.** Both simulation endpoints need the caller's Supabase access
+token: `Authorization: Bearer <access_token>`, the same token the app's
+browser session holds. The server checks it with Supabase Auth (cached for
+a minute). Missing or expired: `401`. A job can only be read back by the
+person who started it; anyone else gets `404`. CORS is not access control
+— it is a browser courtesy that `curl` ignores — so this is what keeps the
+run queue for the app's users.
+
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
-  and where to poll. Returns `429` when too much work is already outstanding,
-  and `503` while the server is shutting down.
+  and where to poll. Returns `429` when the caller already has a run going,
+  has used their hourly allowance, or the server is full, and `503` while the
+  server is shutting down.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
   succeeds. Returns `404` once the result has expired.
 - `GET /health` — liveness probe. `vulnerability_model_loaded` says whether
   the legacy k-means model loaded, which only the `Legacy_Cluster_*` fields
   use; hazard, exposure and risk scoring work without it.
-- `POST /run-simulation` — **deprecated.** Runs the simulation and waits for
-  it, holding the request open for the whole run. Kept only so a frontend
-  deployed before the queued endpoints keeps working; remove it once no
-  deployed client calls it.
 
 `POST /simulations` accepts three optional sections:
 
@@ -275,7 +289,11 @@ A request with none of them returns the pre-computed results for the
 unmodified network, so it finishes almost immediately. Anything else runs a
 real simulation.
 
-Invalid input is rejected with `422` before anything is queued.
+Invalid input is rejected with `422` before anything is queued: every
+value must be a finite number in a physically possible range (see
+`app/schemas.py`), unknown fields are errors, and every node and link id
+must exist in the network. SWMM used to skip an unknown id with a log line
+and return the unmodified network as if the change had applied.
 
 The flow:
 

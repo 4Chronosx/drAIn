@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import pytest
 
-from app.jobs import JobStatus, JobStore, JobStoreClosedError, QueueFullError
+from app.jobs import JobStatus, JobStore, JobStoreClosedError, QueueFullError, UserLimitError
 
 
 @pytest.fixture
@@ -118,19 +118,54 @@ def test_results_expire_so_they_do_not_accumulate():
         store.shutdown()
 
 
-def test_submit_and_wait_returns_a_finished_job(store):
-    job = store.submit_and_wait(lambda: {"ok": True})
-    assert job.status is JobStatus.SUCCEEDED
-    assert job.result == {"ok": True}
+class TestPerOwnerLimits:
+    """One person can't fill the queue, or the hour, for everyone else."""
 
+    def test_an_owner_is_held_to_their_outstanding_limit(self):
+        store = JobStore(
+            max_workers=1, max_queued=4, retention=timedelta(minutes=5), max_jobs_per_owner=1
+        )
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a")
+            with pytest.raises(UserLimitError):
+                store.submit(lambda: {}, owner="a")
+            # Another owner, and ownerless work, still get in.
+            store.submit(lambda: {}, owner="b")
+            store.submit(lambda: {})
+        finally:
+            release.set()
+            store.shutdown()
 
-def test_submit_and_wait_surfaces_failures_as_a_failed_job(store):
-    def explode():
-        raise RuntimeError("nope")
+    def test_a_finished_job_frees_the_owners_slot(self):
+        limited = JobStore(
+            max_workers=1, max_queued=4, retention=timedelta(minutes=5), max_jobs_per_owner=1
+        )
+        try:
+            wait_for(limited.submit(lambda: {}, owner="a"), limited)
+            assert limited.submit(lambda: {}, owner="a").owner == "a"
+        finally:
+            limited.shutdown()
 
-    job = store.submit_and_wait(explode)
-    assert job.status is JobStatus.FAILED
-    assert job.result is None
+    def test_an_owner_is_held_to_their_hourly_allowance(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runs_per_owner_per_hour=2,
+        )
+        try:
+            for _ in range(2):
+                wait_for(store.submit(lambda: {}, owner="a"), store)
+            with pytest.raises(UserLimitError, match="past hour"):
+                store.submit(lambda: {}, owner="a")
+            assert store.submit(lambda: {}, owner="b").owner == "b"
+        finally:
+            store.shutdown()
+
+    def test_a_user_limit_is_a_kind_of_full_queue(self):
+        # So the API answers it with 429 like any other refusal.
+        assert issubclass(UserLimitError, QueueFullError)
 
 
 class TestAbandonedJobs:
@@ -420,8 +455,6 @@ class TestShutdown:
         store.shutdown()
         with pytest.raises(JobStoreClosedError):
             store.submit(lambda: {})
-        with pytest.raises(JobStoreClosedError):
-            store.submit_and_wait(lambda: {})
 
     def test_a_refused_submission_leaves_no_orphan_job(self):
         store = JobStore(max_workers=1, max_queued=1, retention=timedelta(minutes=5))
@@ -450,30 +483,5 @@ class TestShutdown:
             assert "shut down" in after.error
             release.set()
             assert not ran.wait(0.3)
-        finally:
-            release.set()
-
-    def test_a_synchronous_waiter_gets_a_failed_job_on_shutdown(self):
-        """Regression: the waiter used to get CancelledError, a bare 500."""
-        store = JobStore(max_workers=1, max_queued=4, retention=timedelta(minutes=5))
-        release = threading.Event()
-        outcome = {}
-
-        def wait_in_background():
-            try:
-                outcome["job"] = store.submit_and_wait(lambda: {"ok": True})
-            except BaseException as error:
-                outcome["error"] = error
-
-        try:
-            store.submit(hang_until(release))
-            waiter = threading.Thread(target=wait_in_background)
-            waiter.start()
-            wait_until(lambda: store.outstanding() == 2)
-            store.shutdown()
-            waiter.join(5)
-
-            assert "error" not in outcome, outcome.get("error")
-            assert outcome["job"].status is JobStatus.FAILED
         finally:
             release.set()

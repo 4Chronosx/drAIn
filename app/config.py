@@ -25,6 +25,13 @@ def _env_list(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Settings for one process, resolved once at import time."""
@@ -56,6 +63,23 @@ class Settings:
     #: generous; it is a backstop, not the normal path.
     max_queue_wait_seconds: int = 3600
 
+    #: The Supabase project the app signs people in with. Simulations need
+    #: a signed-in caller, checked against this project's Auth service.
+    supabase_url: str | None = None
+    #: The project's public (anon / publishable) key, sent with that check.
+    supabase_anon_key: str | None = None
+
+    #: Refuse simulations from anyone not signed in. Only a local developer
+    #: without a Supabase project should turn this off.
+    require_auth: bool = True
+
+    #: Runs one person may have queued or running at once.
+    max_jobs_per_user: int = 1
+
+    #: Runs one person may start in an hour. With one worker and runs of
+    #: about two minutes, ten an hour is a third of the server's time.
+    max_runs_per_user_per_hour: int = 10
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -67,6 +91,11 @@ class Settings:
             result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
             max_runtime_seconds=int(os.getenv("MAX_RUNTIME_SECONDS", "1800")),
             max_queue_wait_seconds=int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "3600")),
+            supabase_url=os.getenv("SUPABASE_URL") or None,
+            supabase_anon_key=os.getenv("SUPABASE_ANON_KEY") or None,
+            require_auth=_env_flag("REQUIRE_AUTH", True),
+            max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
+            max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),
         )
 
 
