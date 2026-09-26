@@ -244,6 +244,12 @@ barangay in the city.
 > `scripts/validate_against_reports.py` to check the ratings against citizen
 > reports.
 
+Every result carries these limits in `metadata.model_info`: the date the
+network was generated (from the `.inp` title), `calibrated: false`, the
+hazard weights and reference values marked provisional, and what the model
+leaves out (blocked drains, tide at the outfalls, wet ground, real storm
+timing). The app shows them wherever the ratings are read.
+
 `Legacy_Cluster_Category` and `Legacy_Cluster_Score` carry the previous
 k-means output, kept so the two can be compared. It rated 272 nodes that
 flooded — one for 11.7 hours — as "No risk", and its top-50 work list was

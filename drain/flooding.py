@@ -15,6 +15,7 @@ from pyswmm import NodeSeries, Output
 
 from drain.exposure import UNKNOWN_EXPOSURE, exposure_for
 from drain.hazard import DEFAULT_EVENT_HOURS, hazard_for
+from drain.model_info import model_info
 from drain.network import node_locations
 from drain.rpt_parser import FloodedNode, parse_flooding_summary
 from drain.vulnerability import NodeFeatures, VulnerabilityModel, load_model
@@ -179,6 +180,8 @@ def build_flooding_summary(
             "event_hours": event_hours,
             # Nodes the report calls flooded but the binary output does not.
             "inconsistent_nodes": inconsistent,
+            # What the ratings can and cannot claim; shown where they are read.
+            "model_info": model_info(),
             "scoring": {
                 "hazard": "Vulnerability_Score: 0-1, from flood volume, duration and peak rate.",
                 "exposure": (
