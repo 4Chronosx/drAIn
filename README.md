@@ -242,7 +242,8 @@ barangay in the city.
 > 95th percentile of the shipped baseline run, not from a damage study, and
 > are the first thing that should change once there is field evidence. Use
 > `scripts/validate_against_reports.py` to check the ratings against citizen
-> reports.
+> reports. What it would take to defend these ratings, rather than only
+> describe them, is planned in [docs/SCIENCE_ROADMAP.md](docs/SCIENCE_ROADMAP.md).
 
 Every result carries these limits in `metadata.model_info`: the date the
 network was generated (from the `.inp` title), `calibrated: false`, the
