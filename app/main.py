@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -26,6 +26,7 @@ from app.jobs import (
     UserLimitError,
 )
 from app.logging_config import configure_logging
+from app.runs import RunRecorder, RunRepository, RunStoreError, SupabaseRunRepository
 from app.schemas import HealthResponse, JobAccepted, JobState, SimulationRequest
 from drain.flooding import build_flooding_summary
 from drain.hazard import DEFAULT_EVENT_HOURS
@@ -45,8 +46,22 @@ USER_LIMIT_RETRY_SECONDS = 60
 #: How many unknown ids a 422 lists before it stops.
 MAX_IDS_LISTED = 10
 
+#: What a run caught mid-way by a restart says when it is read back.
+RESTARTED_MESSAGE = "The simulation server restarted before this run finished. Please run it again."
 
-def _build_job_store(config: Settings) -> JobStore:
+
+def _build_run_repository(config: Settings) -> RunRepository | None:
+    """Where runs are recorded durably, or ``None`` to keep them in memory only."""
+    if config.supabase_url and config.supabase_service_role_key:
+        return SupabaseRunRepository(config.supabase_url, config.supabase_service_role_key)
+    logger.warning(
+        "SUPABASE_SERVICE_ROLE_KEY is not set: simulation runs are kept in memory only "
+        "and are lost when the server restarts."
+    )
+    return None
+
+
+def _build_job_store(config: Settings, listener=None) -> JobStore:
     return JobStore(
         max_workers=config.max_concurrent_simulations,
         max_queued=config.max_queued_simulations,
@@ -55,6 +70,7 @@ def _build_job_store(config: Settings) -> JobStore:
         max_queue_wait=timedelta(seconds=config.max_queue_wait_seconds),
         max_jobs_per_owner=config.max_jobs_per_user,
         max_runs_per_owner_per_hour=config.max_runs_per_user_per_hour,
+        listener=listener,
     )
 
 
@@ -190,15 +206,22 @@ def current_caller(request: Request) -> Caller:
 SignedIn = Annotated[Caller, Depends(current_caller)]
 
 
-def create_app(config: Settings = settings, authenticator: Authenticator | None = None) -> FastAPI:
+def create_app(
+    config: Settings = settings,
+    authenticator: Authenticator | None = None,
+    runs: RunRepository | None = None,
+) -> FastAPI:
     """Build the application. Kept separate from the module-level instance so
-    tests can construct an app with their own settings and sign-in check."""
-    jobs = _build_job_store(config)
+    tests can construct an app with their own settings, sign-in check and
+    run record."""
     auth = authenticator if authenticator is not None else _build_authenticator(config)
+    repository = runs if runs is not None else _build_run_repository(config)
+    recorder = RunRecorder(repository) if repository is not None else None
+    jobs = _build_job_store(config, listener=recorder.record if recorder else None)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Warm the legacy k-means model so the first run is not slower."""
+        """Warm the legacy k-means model, and settle runs a restart cut short."""
         configure_logging(config.log_level)
         if load_model() is None:
             # Hazard, exposure and risk do not use this model; only the
@@ -207,8 +230,19 @@ def create_app(config: Settings = settings, authenticator: Authenticator | None 
                 "Legacy k-means model unavailable; Legacy_Cluster_* fields will read 'N/A'. "
                 "Hazard and risk scores are unaffected."
             )
+        if repository is not None:
+            # This process has run nothing yet, so any run still marked
+            # queued or running belonged to the one before it, and died with
+            # it. Assumes one server instance, as the Procfile runs.
+            try:
+                repository.fail_unfinished(RESTARTED_MESSAGE)
+                repository.prune(datetime.now(UTC) - timedelta(days=config.run_retention_days))
+            except RunStoreError:
+                logger.exception("Could not tidy recorded simulation runs")
         yield
         jobs.shutdown()
+        if recorder is not None:
+            recorder.close()
 
     app = FastAPI(
         title="DrAIn simulation API",
@@ -269,7 +303,11 @@ def create_app(config: Settings = settings, authenticator: Authenticator | None 
         """
         _reject_unknown_ids(request)
         try:
-            job = jobs.submit(lambda: _simulate(request), owner=caller.user_id)
+            job = jobs.submit(
+                lambda: _simulate(request),
+                owner=caller.user_id,
+                request=request.model_dump(exclude_none=True),
+            )
         except QueueFullError as error:
             raise _queue_full(error) from None
         except JobStoreClosedError as error:
@@ -293,6 +331,12 @@ def create_app(config: Settings = settings, authenticator: Authenticator | None 
         than handed an empty success. Someone else's job is a 404 too.
         """
         job = jobs.get(job_id)
+        if job is None and repository is not None:
+            # Gone from memory -- expired, or a restart -- but recorded.
+            try:
+                job = repository.load(job_id)
+            except RunStoreError:
+                logger.exception("Could not read simulation %s back from Supabase", job_id)
         if job is None or job.owner != caller.user_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

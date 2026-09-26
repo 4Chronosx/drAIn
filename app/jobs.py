@@ -54,6 +54,8 @@ class SimulationJob:
     result: dict[str, Any] | None = None
     #: A message safe to show the caller, once the job fails.
     error: str | None = None
+    #: What was asked for, kept so the run's durable record can say.
+    request: dict[str, Any] | None = None
 
     @property
     def is_finished(self) -> bool:
@@ -110,6 +112,7 @@ class JobStore:
         max_queue_wait: timedelta = timedelta(hours=1),
         max_jobs_per_owner: int | None = None,
         max_runs_per_owner_per_hour: int | None = None,
+        listener: Callable[[SimulationJob], None] | None = None,
     ) -> None:
         self._max_workers = max_workers
         self._executor = self._new_executor()
@@ -122,13 +125,21 @@ class JobStore:
         self._max_jobs_per_owner = max_jobs_per_owner
         self._max_runs_per_owner_per_hour = max_runs_per_owner_per_hour
         self._recent_runs: dict[str, deque[datetime]] = {}
+        # Told of every change (queued, started, finished), with a snapshot.
+        # Called while holding the lock, so it must not block.
+        self._listener = listener
         self._closed = False
         self._lock = threading.Lock()
 
     def _new_executor(self) -> ThreadPoolExecutor:
         return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="simulation")
 
-    def submit(self, work: Callable[[], dict[str, Any]], owner: str | None = None) -> SimulationJob:
+    def submit(
+        self,
+        work: Callable[[], dict[str, Any]],
+        owner: str | None = None,
+        request: dict[str, Any] | None = None,
+    ) -> SimulationJob:
         """Queue a simulation, or raise :class:`QueueFullError`.
 
         The cap counts work that has not finished yet. It is what stops a
@@ -136,7 +147,7 @@ class JobStore:
         still waiting on. An ``owner`` is also held to their own allowance
         (:class:`UserLimitError`).
         """
-        _, accepted = self._enqueue(work, owner)
+        _, accepted = self._enqueue(work, owner, request)
         return accepted
 
     def get(self, job_id: str) -> SimulationJob | None:
@@ -173,7 +184,10 @@ class JobStore:
         executor.shutdown(wait=False, cancel_futures=True)
 
     def _enqueue(
-        self, work: Callable[[], dict[str, Any]], owner: str | None = None
+        self,
+        work: Callable[[], dict[str, Any]],
+        owner: str | None = None,
+        request: dict[str, Any] | None = None,
     ) -> tuple[_Entry, SimulationJob]:
         """Queue work. Returns its entry and a snapshot of the job as accepted."""
         with self._lock:
@@ -186,11 +200,16 @@ class JobStore:
             if outstanding >= self._max_queued:
                 raise QueueFullError(f"{outstanding} simulations are already queued or running.")
 
-            entry = _Entry(job=SimulationJob(id=uuid.uuid4().hex, owner=owner), work=work)
+            entry = _Entry(
+                job=SimulationJob(id=str(uuid.uuid4()), owner=owner, request=request),
+                work=work,
+            )
             if owner is not None:
                 self._recent_runs.setdefault(owner, deque()).append(entry.job.created_at)
             self._entries[entry.job.id] = entry
             accepted = replace(entry.job)
+            # Before dispatch, so "queued" is reported before "running".
+            self._notify(entry.job)
             self._dispatch(entry)
 
         logger.info("Queued simulation %s", entry.job.id)
@@ -227,6 +246,15 @@ class JobStore:
                     "the most allowed. Try again later."
                 )
 
+    def _notify(self, job: SimulationJob) -> None:
+        """Tell the listener about a change. Caller holds the lock."""
+        if self._listener is None:
+            return
+        try:
+            self._listener(replace(job))
+        except Exception:
+            logger.exception("Job listener failed for simulation %s", job.id)
+
     def _dispatch(self, entry: _Entry) -> None:
         """Hand a queued job to the current pool. Caller holds the lock."""
         entry.future = self._executor.submit(self._run, entry)
@@ -241,6 +269,7 @@ class JobStore:
             work, entry.work = entry.work, None
             job.status = JobStatus.RUNNING
             job.started_at = _now()
+            self._notify(job)
         logger.info("Running simulation %s", job.id)
 
         try:
@@ -294,6 +323,7 @@ class JobStore:
         job.result = None if error is not None else result
         job.error = error
         entry.work = None
+        self._notify(job)
         if entry.future is not None:
             # Only takes effect while the job is still waiting for a worker.
             entry.future.cancel()

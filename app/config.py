@@ -68,6 +68,13 @@ class Settings:
     supabase_url: str | None = None
     #: The project's public (anon / publishable) key, sent with that check.
     supabase_anon_key: str | None = None
+    #: The project's service-role key. With it, every run is also recorded in
+    #: the simulation_runs table, so results survive a restart. A secret:
+    #: set it only in the host's environment.
+    supabase_service_role_key: str | None = None
+
+    #: How long recorded runs are kept in Supabase.
+    run_retention_days: int = 7
 
     #: Refuse simulations from anyone not signed in. Only a local developer
     #: without a Supabase project should turn this off.
@@ -93,6 +100,8 @@ class Settings:
             max_queue_wait_seconds=int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "3600")),
             supabase_url=os.getenv("SUPABASE_URL") or None,
             supabase_anon_key=os.getenv("SUPABASE_ANON_KEY") or None,
+            supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
+            run_retention_days=int(os.getenv("RUN_RETENTION_DAYS", "7")),
             require_auth=_env_flag("REQUIRE_AUTH", True),
             max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
             max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),

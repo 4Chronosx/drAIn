@@ -207,6 +207,8 @@ All optional; the defaults cover local development and the known deployments.
 | `REQUIRE_AUTH` | `true` | Refuse simulations from callers who are not signed in. Turn off only for local development |
 | `MAX_JOBS_PER_USER` | `1` | Runs one person may have queued or running at once |
 | `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
+| `SUPABASE_SERVICE_ROLE_KEY` | unset | Records every run in the `simulation_runs` table so results survive a restart. A secret: set it only in the host's environment |
+| `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
 
 Without `SUPABASE_URL` and `SUPABASE_ANON_KEY` the server refuses every
 simulation with `503` rather than opening them to everyone. To try the API
@@ -308,10 +310,21 @@ GET  /simulations/{job_id}   -> 200 { status: "succeeded", result: { ... } }
 `{ status: "failed", error: "..." }` with a `200` — the request to read the
 job succeeded; the simulation is what failed.
 
-> **Single worker.** Jobs live in the serving process's memory, which is why
-> the Procfile pins `--workers 1`. With more than one, a poll can land on a
-> process that has never heard of the job. Running several workers, or more
-> than one instance, needs a shared job store (Redis, or a table) first.
+**Runs survive restarts.** With `SUPABASE_SERVICE_ROLE_KEY` set, every run is
+also written to the `simulation_runs` table in Supabase as it is queued,
+starts and finishes (the table is defined in the frontend repository's
+`supabase/schemas/schema_ops.sql`). A poll for a run the server no longer
+holds in memory — it expired, or the server restarted — is answered from
+there. On start-up, runs a restart cut short are marked failed with a
+message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted.
+Users can read their own runs from the table; nobody but the server can
+write them. Without the key, runs live in memory only and are lost on a
+restart; the server logs a warning at start-up.
+
+> **Single worker.** Queued work still lives in the serving process, which
+> is why the Procfile pins `--workers 1`, and start-up assumes any
+> unfinished run in the table belonged to the previous process. Running
+> several workers or instances needs a shared queue first.
 
 ---
 
