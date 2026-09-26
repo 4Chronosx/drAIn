@@ -1,8 +1,8 @@
 """Check the flood-hazard model against citizen reports.
 
-The model is unsupervised: k-means groups nodes by simulated flooding, and
-nothing has ever checked whether those groups correspond to flooding people
-actually experience. The reports table is the only ground truth available --
+The hazard score is built from simulated flooding alone, and nothing has
+ever checked whether it matches the flooding people actually experience.
+The reports table is the only ground truth available --
 each report is pinned to the nearest drainage component -- so this asks the
 obvious question:
 
@@ -16,7 +16,9 @@ Usage::
 
     SUPABASE_URL=... SUPABASE_KEY=... python -m scripts.validate_against_reports
 
-Reads nothing but the reports table, and writes nothing back.
+Reads nothing but the reports table, and writes nothing back. Reports
+agency staff rejected (spam, duplicates, not a drainage problem) are left
+out, as they are from every count in the app.
 """
 
 from __future__ import annotations
@@ -29,15 +31,28 @@ import sys
 import urllib.parse
 import urllib.request
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from app.logging_config import configure_logging
 from drain.flooding import build_flooding_summary
+from drain.hazard import CATEGORY_THRESHOLDS, NO_HAZARD
 from drain.paths import BASE_OUT, BASE_RPT
 
 logger = logging.getLogger(__name__)
 
-HAZARD_RANK = {"No risk": 0, "Low": 1, "Medium": 2, "High": 3}
+#: Every category the scorer emits, lowest first. Built from drain.hazard so
+#: it can't drift: it used to list "No risk", the old k-means label, and a
+#: real run died on the first "No hazard" node.
+HAZARD_RANK = {
+    NO_HAZARD: 0,
+    **{name: rank for rank, (_, name) in enumerate(reversed(CATEGORY_THRESHOLDS), start=1)},
+}
+
+#: The API returns at most this many rows per request (max_rows), without
+#: saying it stopped, so reports are read a page at a time.
+PAGE_SIZE = 1000
 
 #: Work-list sizes to report agreement at. An agency acts on the top of the
 #: list, so that is where a ranking has to be right.
@@ -51,15 +66,40 @@ class Report:
     created_at: str | None
 
 
-def fetch_reports(url: str, key: str, limit: int = 10000) -> list[Report]:
-    """Read the reports table through PostgREST."""
-    query = urllib.parse.urlencode({"select": "component_id,category,created_at", "limit": limit})
-    request = urllib.request.Request(
-        f"{url.rstrip('/')}/rest/v1/reports?{query}",
-        headers={"apikey": key, "Authorization": f"Bearer {key}"},
-    )
+def _get_json(url: str, headers: dict[str, str]) -> Any:
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=30) as response:
-        rows = json.load(response)
+        return json.load(response)
+
+
+def fetch_reports(
+    url: str,
+    key: str,
+    get_json: Callable[[str, dict[str, str]], Any] = _get_json,
+) -> list[Report]:
+    """Read every report staff haven't rejected, through PostgREST.
+
+    A page at a time: one request used to ask for 10,000 rows and silently
+    got the first 1,000.
+    """
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        query = urllib.parse.urlencode(
+            {
+                "select": "component_id,category,created_at",
+                "review_status": "neq.rejected",
+                "order": "id",
+                "limit": PAGE_SIZE,
+                "offset": offset,
+            }
+        )
+        page = get_json(f"{url.rstrip('/')}/rest/v1/reports?{query}", headers)
+        rows.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
 
     return [
         Report(
@@ -140,7 +180,7 @@ def compare_against_volume_baseline(matched: set[str], nodes: dict[str, dict]) -
         volume_hits = sum(1 for node_id, _ in by_volume[:n] if node_id in matched)
         print(f"{n:>6}  {model_hits:>8}  {volume_hits:>12}")
     print(
-        "\nIf the two columns match, the clustering is not adding anything a\n"
+        "\nIf the two columns match, the hazard score is not adding anything a\n"
         "sort on flood volume does not already give you."
     )
 

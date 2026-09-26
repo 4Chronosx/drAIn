@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import pytest
 
+from drain.hazard import categorise
 from scripts.validate_against_reports import (
     HAZARD_RANK,
+    PAGE_SIZE,
     Report,
     compare_against_volume_baseline,
     compare_distributions,
+    fetch_reports,
     summarise_join,
 )
 
@@ -26,13 +29,36 @@ def nodes():
     return {
         "I-1": node("High", 100.0),
         "I-2": node("Medium", 10.0),
-        "I-3": node("No risk", 0.0),
-        "I-4": node("No risk", 0.0),
+        "I-3": node("No hazard", 0.0),
+        "I-4": node("No hazard", 0.0),
     }
 
 
 def test_every_category_the_model_emits_has_a_rank():
-    assert set(HAZARD_RANK) == {"No risk", "Low", "Medium", "High"}
+    assert set(HAZARD_RANK) == {"No hazard", "Low", "Medium", "High"}
+
+
+def test_the_ranks_cover_what_the_scorer_actually_says():
+    """Regression: the ranks said "No risk", the scorer says "No hazard"."""
+    emitted = {categorise(score / 100) for score in range(0, 101)}
+    assert emitted <= set(HAZARD_RANK)
+    assert HAZARD_RANK["High"] > HAZARD_RANK["Medium"] > HAZARD_RANK["Low"] > 0
+
+
+def test_reports_are_read_a_page_at_a_time_without_rejected_ones():
+    urls = []
+
+    def get_json(url, headers):
+        urls.append(url)
+        size = PAGE_SIZE if len(urls) == 1 else 5
+        return [{"component_id": "I-1", "category": "inlets", "created_at": None}] * size
+
+    reports = fetch_reports("https://p.supabase.co", "key", get_json=get_json)
+
+    assert len(reports) == PAGE_SIZE + 5
+    assert len(urls) == 2
+    assert all("review_status=neq.rejected" in url for url in urls)
+    assert "offset=1000" in urls[1]
 
 
 def test_join_matches_components_that_exist_in_the_model(nodes, capsys):
