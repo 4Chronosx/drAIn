@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.auth import (
     Authenticator,
@@ -267,6 +268,9 @@ def create_app(
         # here, and the polling client needs both.
         expose_headers=["Retry-After", "Location"],
     )
+    # A finished run's result is about 1.1 MB of JSON, sent to every poll
+    # once it is done. Gzipped it is about 40 KB.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

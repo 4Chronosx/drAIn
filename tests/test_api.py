@@ -416,3 +416,16 @@ def test_browsers_may_read_the_polling_headers(client):
         for header in response.headers["access-control-expose-headers"].split(",")
     }
     assert {"retry-after", "location"} <= exposed
+
+
+def test_finished_results_are_compressed_for_clients_that_accept_gzip(client):
+    response = client.post("/simulations", json={})
+    poll_url = response.json()["poll_url"]
+    poll_until_finished(client, poll_url)
+
+    compressed = client.get(poll_url, headers={"Accept-Encoding": "gzip"})
+    assert compressed.headers.get("content-encoding") == "gzip"
+    assert compressed.json()["status"] == "succeeded"
+
+    plain = client.get(poll_url, headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
