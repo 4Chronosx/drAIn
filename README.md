@@ -312,8 +312,9 @@ GET  /simulations/{job_id}   -> 200 { status: "running" }        # repeat
 GET  /simulations/{job_id}   -> 200 { status: "succeeded", result: { ... } }
 ```
 
-`result` carries `metadata`, `nodes_list` (for iteration) and `nodes_dict`
-(for lookup by node ID). A failed run comes back as
+`result` carries `metadata` and `nodes_list`, one row per node. (It used to
+repeat every row in a `nodes_dict` keyed by node ID, which doubled the size;
+build a lookup on the client if you need one.) A failed run comes back as
 `{ status: "failed", error: "..." }` with a `200` — the request to read the
 job succeeded; the simulation is what failed.
 

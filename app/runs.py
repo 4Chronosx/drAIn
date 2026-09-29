@@ -88,21 +88,12 @@ def _iso(moment: datetime | None) -> str | None:
 
 
 def _compact(result: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The result without \`\`nodes_dict\`\`, which repeats \`\`nodes_list\`\`."""
+    """The result without ``nodes_dict``, which repeats ``nodes_list``. The API
+    no longer sends it (app.main.served); this still keeps it out of the
+    table if a result ever carries it."""
     if result is None:
         return None
     return {key: value for key, value in result.items() if key != "nodes_dict"}
-
-
-def _expand(result: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Rebuild \`\`nodes_dict\`\` from \`\`nodes_list\`\`, as the API serves it."""
-    if result is None or "nodes_list" not in result:
-        return result
-    nodes_dict = {
-        row["Node"]: {key: value for key, value in row.items() if key != "Node"}
-        for row in result["nodes_list"]
-    }
-    return {**result, "nodes_dict": nodes_dict}
 
 
 @dataclass
@@ -178,7 +169,7 @@ class SupabaseRunRepository:
             finished_at=(
                 datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
             ),
-            result=_expand(row["result"]),
+            result=row["result"],
             error=row["error"],
         )
 

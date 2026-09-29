@@ -84,7 +84,7 @@ class TestSupabaseRunRepository:
         repository(fake).save(finished_job(request={"nodes": {}}))
         assert fake.calls[1][3]["request"] == {"nodes": {}}
 
-    def test_a_loaded_run_serves_nodes_dict_again(self):
+    def test_a_loaded_run_is_served_as_it_was_stored(self):
         row = {
             "id": JOB_ID,
             "user_id": USER_A,
@@ -99,7 +99,7 @@ class TestSupabaseRunRepository:
 
         assert job.owner == USER_A
         assert job.status is JobStatus.SUCCEEDED
-        assert job.result["nodes_dict"] == {"I-4": {"Hours_Flooded": 1.5}}
+        assert job.result == {"nodes_list": [{"Node": "I-4", "Hours_Flooded": 1.5}]}
 
     def test_an_unknown_run_is_none(self):
         assert repository(FakePostgrest(200, b"[]")).load(JOB_ID) is None

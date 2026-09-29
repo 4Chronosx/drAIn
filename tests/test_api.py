@@ -99,14 +99,19 @@ def test_unmodified_request_serves_the_baseline(client):
     assert len(body["nodes_list"]) == 1413
 
 
-def test_baseline_exposes_the_same_nodes_as_a_list_and_a_dict(client):
+def test_each_node_is_sent_once(client):
+    # nodes_dict repeated every row keyed by id and doubled the payload.
     body = baseline(client)
-    assert {row["Node"] for row in body["nodes_list"]} == set(body["nodes_dict"])
+    assert "nodes_dict" not in body
+    assert "structure_info" not in body["metadata"]
+    ids = [row["Node"] for row in body["nodes_list"]]
+    assert len(ids) == len(set(ids)) == 1413
 
 
 def test_node_rows_carry_the_documented_fields(client):
     body = baseline(client)
-    assert set(body["nodes_dict"]["I-4"]) == {
+    row = next(row for row in body["nodes_list"] if row["Node"] == "I-4")
+    assert set(row) - {"Node"} == {
         # Raw flooding figures from the simulation.
         "Hours_Flooded",
         "Maximum_Rate_CMS",
