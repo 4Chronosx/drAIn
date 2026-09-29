@@ -285,7 +285,7 @@ Live results carry `metadata.model_info`, built from the scorer's own constants.
 ## 3. Order of work
 
 **Phase 1, weeks 1–3. Make the uncertainty visible (no new data).**
-- A1: sensitivity and rank bands.
+- A1: sensitivity and rank bands. Sensitivity done 2026-09-29 (`scripts/sensitivity.py`, `docs/sensitivity-2026-09-29.md`): median Kendall τ 0.963, top-50 overlap 0.923, 45 of the top 50 hold in 90%+ of 2,000 draws. Rank bands in the API payload still to do.
 - C1: within-barangay validation of hazard, with confirmed reports only.
 - B1: no invented exposure.
 - G1: version stamp.
