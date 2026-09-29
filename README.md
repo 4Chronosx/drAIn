@@ -71,7 +71,6 @@ Urban flood modeling typically requires specialized software and technical exper
 ### Simulation & ML
 <p align="left">
   <a href="https://www.epa.gov/water-research/storm-water-management-model-swmm"><img alt="PySWMM" src="https://img.shields.io/badge/PySWMM-0078D4?logo=python&logoColor=white&style=flat" /></a>
-  <a href="https://scikit-learn.org/"><img alt="scikit-learn" src="https://img.shields.io/badge/scikit--learn-F7931E?logo=scikitlearn&logoColor=white&style=flat" /></a>
   <a href="https://numpy.org/"><img alt="NumPy" src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white&style=flat" /></a>
 </p>
 
@@ -108,7 +107,6 @@ drAIn-backend/
 │   ├── rainfall.py        # Design-storm generation
 │   ├── rpt_parser.py      # Parses SWMM .rpt reports
 │   ├── swmm_runner.py     # Runs SWMM
-│   └── vulnerability.py   # The superseded k-means model
 ├── scripts/               # Analysis, not imported by the server
 │   └── validate_against_reports.py
 ├── data/                  # SWMM network and trained model
@@ -116,7 +114,6 @@ drAIn-backend/
 │   ├── Mandaue_Drainage_Network.out
 │   ├── Mandaue_Drainage_Network.rpt
 │   ├── mandaue_population.geojson
-│   └── vulnerability_model_k4.pkl
 ├── tests/                 # pytest suite
 ├── Python_Notebooks/      # Data preprocessing notebooks
 │   ├── INP_FILE_GENERATOR.ipynb
@@ -251,10 +248,13 @@ hazard weights and reference values marked provisional, and what the model
 leaves out (blocked drains, tide at the outfalls, wet ground, real storm
 timing). The app shows them wherever the ratings are read.
 
-`Legacy_Cluster_Category` and `Legacy_Cluster_Score` carry the previous
-k-means output, kept so the two can be compared. It rated 272 nodes that
-flooded — one for 11.7 hours — as "No risk", and its top-50 work list was
-identical to sorting on flood volume alone.
+Until 2026-09-29 results also carried `Legacy_Cluster_*` fields from the
+k-means model this score replaced, for comparison. That model rated 272
+nodes that flooded (one for 11.7 hours) as "No risk", and its top-50 work
+list was identical to sorting on flood volume alone. Nothing read the
+fields, so they were retired with the pickled model and scikit-learn. The
+stored per-storm scenarios in the frontend's database still carry that
+model's clusters until they are regenerated (docs/SCIENCE_ROADMAP.md, D).
 
 The field names still say "Vulnerability" because they are the wire
 contract. The user-facing term is "flood hazard".
@@ -280,9 +280,7 @@ run queue for the app's users.
   server is shutting down.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
   succeeds. Returns `404` once the result has expired.
-- `GET /health` — liveness probe. `vulnerability_model_loaded` says whether
-  the legacy k-means model loaded, which only the `Legacy_Cluster_*` fields
-  use; hazard, exposure and risk scoring work without it.
+- `GET /health` — liveness probe: `{"status": "ok"}`.
 
 `POST /simulations` accepts three optional sections:
 
@@ -343,7 +341,7 @@ The `Python_Notebooks/` directory contains Google Colab notebooks for:
 - **Data Preprocessing**: Converting raw drainage survey data into SWMM-compatible formats
 - **Geospatial Processing**: Handling coordinate systems and network topology
 - **Data Validation**: Ensuring data quality and completeness
-- **Feature Engineering**: Creating inputs for ML-based vulnerability ranking
+- **Feature Engineering**: Inputs for the earlier k-means vulnerability model (retired)
 
 ### 📁 Raw Data Access
 

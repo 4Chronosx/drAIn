@@ -7,8 +7,4 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = [
-    # The shipped model was fitted with scikit-learn 1.6.1; the pinned runtime
-    # is 1.9.1, which warns on unpickle but produces identical predictions.
-    "ignore::sklearn.exceptions.InconsistentVersionWarning",
-]
+filterwarnings = []

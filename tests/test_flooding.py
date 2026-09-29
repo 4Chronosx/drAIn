@@ -9,7 +9,7 @@ import pytest
 
 from drain import flooding
 from drain.exposure import UNKNOWN_EXPOSURE, exposure_for
-from drain.flooding import NO_OVERFLOW_MINUTES, _minutes_until_overflow, build_flooding_summary
+from drain.flooding import _minutes_until_overflow, build_flooding_summary
 from drain.hazard import hazard_for
 from drain.network import node_locations
 from drain.paths import BASE_OUT, BASE_RPT
@@ -29,7 +29,7 @@ class TestMinutesUntilOverflow:
     def test_an_empty_series_is_no_data_not_zero_minutes(self):
         """Regression: an empty series reported the node overflowing at 0.0
         minutes, a measurement nobody made."""
-        assert _minutes_until_overflow(series_of({}), "N") == NO_OVERFLOW_MINUTES
+        assert _minutes_until_overflow(series_of({}), "N") is None
 
     def test_the_first_positive_rate_sets_the_time(self):
         start = datetime(2024, 1, 1, 0, 0)
@@ -42,7 +42,7 @@ class TestMinutesUntilOverflow:
 
     def test_a_series_that_never_rises_is_the_sentinel(self):
         losses = {datetime(2024, 1, 1, 0, 0): 0.0, datetime(2024, 1, 1, 0, 5): 0.0}
-        assert _minutes_until_overflow(series_of(losses), "N") == NO_OVERFLOW_MINUTES
+        assert _minutes_until_overflow(series_of(losses), "N") is None
 
     def test_an_empty_series_is_served_as_null(self, monkeypatch):
         class EmptySeries:

@@ -232,7 +232,7 @@ Overclaiming costs credibility with exactly the engineers the tool is for.
   - the frontend landing and docs pages (`app/(main)/docs/sections/*`);
   - the README badges and "Simulation & ML" section;
   - `lib/chatbot/prompts.ts`: the "satellite data" and "AI analysis" lines. The assistant is now at least told that ratings are simulated and provisional.
-- Retire the `Legacy_Cluster_*` fields and the pickled k-means model once D regenerates the stored scenarios. Keep the comparison in a dated note.
+- Retire the `Legacy_Cluster_*` fields and the pickled k-means model. Done 2026-09-29, ahead of D: nothing read them, and the stored scenarios keep their clusters in the database. The comparison is kept as a dated note in the README.
 
 **Step 2 (L, optional): machine learning where it earns its place.** Each of these needs its own validation before it ships.
 - **A surrogate model** trained on many SWMM runs, answering what-if questions in milliseconds instead of minutes, with a stated error against SWMM on held-out runs. The notebook's Drive folder is named "ML Surrogate Model", so this was the original intent.

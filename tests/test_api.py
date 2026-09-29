@@ -80,10 +80,8 @@ def baseline(client):
     return finished["result"]
 
 
-def test_health_reports_the_model_is_available(client):
-    body = client.get("/health").json()
-    assert body["status"] == "ok"
-    assert body["vulnerability_model_loaded"] is True
+def test_health_says_ok(client):
+    assert client.get("/health").json() == {"status": "ok"}
 
 
 def test_health_needs_no_sign_in():
@@ -130,15 +128,12 @@ def test_node_rows_carry_the_documented_fields(client):
         "Exposure_Distance_m",
         # The two combined.
         "Risk_Score",
-        # The superseded k-means output.
-        "Legacy_Cluster_Category",
-        "Legacy_Cluster_Score",
     }
 
 
 def test_metadata_does_not_leak_server_paths(client):
     metadata = baseline(client)["metadata"]
-    for key in ("rpt_file", "out_file", "model_file"):
+    for key in ("rpt_file", "out_file"):
         assert "/" not in metadata[key] and "\\" not in metadata[key]
 
 

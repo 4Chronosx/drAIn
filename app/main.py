@@ -33,7 +33,6 @@ from drain.flooding import build_flooding_summary
 from drain.hazard import DEFAULT_EVENT_HOURS
 from drain.network import link_suffixes, node_ids
 from drain.swmm_runner import run_simulation
-from drain.vulnerability import load_model
 
 logger = logging.getLogger(__name__)
 
@@ -235,15 +234,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Warm the legacy k-means model, and settle runs a restart cut short."""
+        """Set up logging, and settle runs a restart cut short."""
         configure_logging(config.log_level)
-        if load_model() is None:
-            # Hazard, exposure and risk do not use this model; only the
-            # Legacy_Cluster_* comparison fields do.
-            logger.warning(
-                "Legacy k-means model unavailable; Legacy_Cluster_* fields will read 'N/A'. "
-                "Hazard and risk scores are unaffected."
-            )
         if repository is not None:
             # This process has run nothing yet, so any run still marked
             # queued or running belonged to the one before it, and died with
@@ -289,15 +281,8 @@ def create_app(
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
-        """Liveness probe that also reports whether the legacy k-means model loaded.
-
-        ``vulnerability_model_loaded`` covers only the Legacy_Cluster_* fields.
-        Hazard, exposure and risk scoring do not depend on it.
-        """
-        return HealthResponse(
-            status="ok",
-            vulnerability_model_loaded=load_model() is not None,
-        )
+        """Liveness probe."""
+        return HealthResponse(status="ok")
 
     @app.post(
         "/simulations",

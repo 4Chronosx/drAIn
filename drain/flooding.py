@@ -1,8 +1,8 @@
 """Assembly of the node flooding payload served by the API.
 
 Combines three sources: the flooded-node table from the ``.rpt`` report, the
-overflow timing from the ``.out`` binary output, and risk categories from the
-trained vulnerability model.
+overflow timing from the ``.out`` binary output, the hazard score
+(drain/hazard.py) and population exposure (drain/exposure.py).
 """
 
 from __future__ import annotations
@@ -18,14 +18,8 @@ from drain.hazard import DEFAULT_EVENT_HOURS, hazard_for
 from drain.model_info import model_info
 from drain.network import node_locations
 from drain.rpt_parser import FloodedNode, parse_flooding_summary
-from drain.vulnerability import NodeFeatures, VulnerabilityModel, load_model
 
 logger = logging.getLogger(__name__)
-
-#: Internal marker for "no overflow time". The legacy k-means model needs a
-#: number for every node, so this stands in for one internally; the payload
-#: never serves it and reports null instead (see ``Time_After_Raining_min``).
-NO_OVERFLOW_MINUTES = 9999.0
 
 #: Figures reported for a node that does not appear in the flooding summary.
 _NO_FLOODING = FloodedNode(
@@ -37,28 +31,26 @@ _NO_FLOODING = FloodedNode(
 )
 
 
-def _minutes_until_overflow(node_series: NodeSeries, node_id: str) -> float:
+def _minutes_until_overflow(node_series: NodeSeries, node_id: str) -> float | None:
     """Minutes from simulation start until the node first overflows.
 
-    Returns :data:`NO_OVERFLOW_MINUTES` if it never does, or if the output
-    has no series for it at all: that is missing data, not an overflow at
-    minute zero.
+    None if it never does, or if the output has no series for it at all:
+    that is missing data, not an overflow at minute zero.
     """
     losses = node_series[node_id].flooding_losses
     if not losses:
-        return NO_OVERFLOW_MINUTES
+        return None
 
     start = next(iter(losses))
     for timestamp, rate in losses.items():
         if rate > 0:
             return round((timestamp - start).total_seconds() / 60, 2)
-    return NO_OVERFLOW_MINUTES
+    return None
 
 
 def build_flooding_summary(
     rpt_path: Path,
     out_path: Path,
-    model: VulnerabilityModel | None = None,
     event_hours: float = DEFAULT_EVENT_HOURS,
 ) -> dict[str, Any]:
     """Build the full node flooding payload for a completed simulation.
@@ -69,11 +61,10 @@ def build_flooding_summary(
     frontend uses both.
     """
     flooded = parse_flooding_summary(rpt_path)
-    if model is None:
-        model = load_model()
 
     node_ids: list[str] = []
-    features: list[NodeFeatures] = []
+    #: Minutes until each node first overflows, or None if it never does.
+    overflow_minutes: dict[str, float | None] = {}
 
     with Output(str(out_path)) as out:
         series = NodeSeries(out)
@@ -82,25 +73,10 @@ def build_flooding_summary(
 
             # The overflow timing is only reported for nodes that actually
             # flooded, so skip reading the (large) time series for the rest.
-            time_after_rain = (
-                _minutes_until_overflow(series, node_id)
-                if summary is not None
-                else NO_OVERFLOW_MINUTES
-            )
-            summary = summary or _NO_FLOODING
-
             node_ids.append(node_id)
-            features.append(
-                NodeFeatures(
-                    time_after_raining_min=time_after_rain,
-                    hours_flooded=summary.hours_flooded,
-                    maximum_rate_cms=summary.maximum_rate_cms,
-                    time_of_max_hr_min=summary.time_of_max_minutes,
-                    total_flood_volume=summary.total_flood_volume,
-                )
+            overflow_minutes[node_id] = (
+                _minutes_until_overflow(series, node_id) if summary is not None else None
             )
-
-    predictions = model.predict_many(features) if model is not None else [None] * len(features)
 
     nodes_list: list[dict[str, Any]] = []
     nodes_dict: dict[str, dict[str, Any]] = {}
@@ -108,8 +84,9 @@ def build_flooding_summary(
     exposures = exposures_for_nodes(node_locations())
     inconsistent = 0
 
-    for node_id, feature, prediction in zip(node_ids, features, predictions, strict=True):
+    for node_id in node_ids:
         summary = flooded.get(node_id, _NO_FLOODING)
+        minutes = overflow_minutes[node_id]
 
         hazard = hazard_for(
             total_flood_volume=summary.total_flood_volume,
@@ -125,7 +102,7 @@ def build_flooding_summary(
         # every routing step but writes the output once a minute, so brief or
         # flickering overflows miss it (docs/findings/2026-09-29-rpt-vs-out-
         # flooding.md). Counted so the mismatch is visible.
-        if summary.hours_flooded > 0 and feature.time_after_raining_min >= NO_OVERFLOW_MINUTES:
+        if summary.hours_flooded > 0 and minutes is None:
             inconsistent += 1
 
         row = {
@@ -134,14 +111,8 @@ def build_flooding_summary(
             "Time_of_Max_days": summary.time_of_max_days,
             "Time_of_Max_hr_min": summary.time_of_max_minutes,
             "Total_Flood_Volume_10e6_ltr": summary.total_flood_volume,
-            # null, not the sentinel. 9999 is an internal marker for "never
-            # overflowed"; served as-is it reads as a measurement, and the
-            # results table showed "9,999" for three quarters of all nodes.
-            "Time_After_Raining_min": (
-                None
-                if feature.time_after_raining_min >= NO_OVERFLOW_MINUTES
-                else feature.time_after_raining_min
-            ),
+            # null when the node never overflowed.
+            "Time_After_Raining_min": minutes,
             # Hazard: how badly this node floods. Transparent and monotonic.
             "Vulnerability_Category": hazard.category,
             "Vulnerability_Score": hazard.score,
@@ -157,9 +128,6 @@ def build_flooding_summary(
             "Risk_Score": (
                 None if exposure.score is None else round(hazard.score * exposure.score, 6)
             ),
-            # The previous k-means output, kept for comparison.
-            "Legacy_Cluster_Category": prediction.category if prediction else "N/A",
-            "Legacy_Cluster_Score": prediction.score if prediction else 0.0,
         }
         nodes_dict[node_id] = row
         nodes_list.append({"Node": node_id, **row})
@@ -184,7 +152,6 @@ def build_flooding_summary(
             # for a simulated run, point into a temporary directory.
             "rpt_file": Path(rpt_path).name,
             "out_file": Path(out_path).name,
-            "model_file": "N/A" if model is None else "vulnerability_model_k4.pkl",
             "event_hours": event_hours,
             # Nodes the report calls flooded but the binary output does not.
             "inconsistent_nodes": inconsistent,
@@ -204,7 +171,6 @@ def build_flooding_summary(
                     "'nearest'). null when neither is known (Exposure_Basis 'unknown')."
                 ),
                 "risk": "Risk_Score: hazard x exposure, null when exposure is. Rank on this.",
-                "legacy": "Legacy_Cluster_*: the previous k-means output, retained for comparison.",
             },
             "structure_info": {
                 "nodes_list": "Array format - use for iteration and listing all nodes",
