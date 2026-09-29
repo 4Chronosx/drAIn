@@ -13,7 +13,7 @@ from typing import Any
 
 from pyswmm import NodeSeries, Output
 
-from drain.exposure import UNKNOWN_EXPOSURE, exposure_for
+from drain.exposure import UNKNOWN_EXPOSURE, exposures_for_nodes
 from drain.hazard import DEFAULT_EVENT_HOURS, hazard_for
 from drain.model_info import model_info
 from drain.network import node_locations
@@ -105,7 +105,7 @@ def build_flooding_summary(
     nodes_list: list[dict[str, Any]] = []
     nodes_dict: dict[str, dict[str, Any]] = {}
 
-    locations = node_locations()
+    exposures = exposures_for_nodes(node_locations())
     inconsistent = 0
 
     for node_id, feature, prediction in zip(node_ids, features, predictions, strict=True):
@@ -117,7 +117,7 @@ def build_flooding_summary(
             maximum_rate_cms=summary.maximum_rate_cms,
             event_hours=event_hours,
         )
-        exposure = exposure_for(locations[node_id]) if node_id in locations else UNKNOWN_EXPOSURE
+        exposure = exposures.get(node_id, UNKNOWN_EXPOSURE)
 
         # The report's summary table and the binary output disagree for some
         # nodes: the first says the node flooded, the second shows no
@@ -146,9 +146,15 @@ def build_flooding_summary(
             # Exposure: roughly how many people are around it.
             "Barangay": exposure.barangay,
             "Population_Density": exposure.density,
-            "Exposure_Score": round(exposure.score, 4),
+            # null when the population around the node isn't known; see
+            # Exposure_Basis. Risk is then null too rather than a guess.
+            "Exposure_Score": None if exposure.score is None else round(exposure.score, 4),
+            "Exposure_Basis": exposure.basis,
+            "Exposure_Distance_m": exposure.distance_m,
             # Risk: the two together, which is what a work list should rank on.
-            "Risk_Score": round(hazard.score * exposure.score, 6),
+            "Risk_Score": (
+                None if exposure.score is None else round(hazard.score * exposure.score, 6)
+            ),
             # The previous k-means output, kept for comparison.
             "Legacy_Cluster_Category": prediction.category if prediction else "N/A",
             "Legacy_Cluster_Score": prediction.score if prediction else 0.0,
@@ -180,14 +186,22 @@ def build_flooding_summary(
             "event_hours": event_hours,
             # Nodes the report calls flooded but the binary output does not.
             "inconsistent_nodes": inconsistent,
+            # How each node's exposure was found: inside a barangay, from
+            # the nearest one, or not at all.
+            "exposure_basis_counts": {
+                basis: sum(1 for row in nodes_list if row["Exposure_Basis"] == basis)
+                for basis in ("inside", "nearest", "unknown")
+            },
             # What the ratings can and cannot claim; shown where they are read.
             "model_info": model_info(),
             "scoring": {
                 "hazard": "Vulnerability_Score: 0-1, from flood volume, duration and peak rate.",
                 "exposure": (
-                    "Exposure_Score: 0-1, from the population density of the containing barangay."
+                    "Exposure_Score: 0-1, from the population density of the barangay the "
+                    "node is in, or of the nearest one within 250 m (Exposure_Basis "
+                    "'nearest'). null when neither is known (Exposure_Basis 'unknown')."
                 ),
-                "risk": "Risk_Score: hazard x exposure. Rank work lists on this.",
+                "risk": "Risk_Score: hazard x exposure, null when exposure is. Rank on this.",
                 "legacy": "Legacy_Cluster_*: the previous k-means output, retained for comparison.",
             },
             "structure_info": {

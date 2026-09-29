@@ -62,6 +62,9 @@ class TestMinutesUntilOverflow:
 class TestScores:
     def test_risk_is_hazard_times_exposure(self, baseline):
         for row in baseline["nodes_list"]:
+            if row["Exposure_Score"] is None:
+                assert row["Risk_Score"] is None
+                continue
             assert row["Risk_Score"] == pytest.approx(
                 row["Vulnerability_Score"] * row["Exposure_Score"], abs=1e-4
             )
@@ -82,14 +85,25 @@ class TestScores:
         exposure = exposure_for(point)
         row = baseline["nodes_dict"][node_id]
         assert row["Barangay"] == exposure.barangay
-        assert row["Exposure_Score"] == round(exposure.score, 4)
+        assert row["Exposure_Score"] == (
+            None if exposure.score is None else round(exposure.score, 4)
+        )
 
-    def test_a_node_without_coordinates_gets_neutral_exposure(self, monkeypatch):
+    def test_a_node_without_coordinates_has_unknown_exposure_and_risk(self, monkeypatch):
         monkeypatch.setattr(flooding, "node_locations", lambda: {})
-        rows = build_flooding_summary(BASE_RPT, BASE_OUT)["nodes_list"]
+        summary = build_flooding_summary(BASE_RPT, BASE_OUT)
+        rows = summary["nodes_list"]
         assert all(r["Barangay"] is None for r in rows)
-        assert all(r["Exposure_Score"] == UNKNOWN_EXPOSURE.score for r in rows)
+        assert all(r["Exposure_Score"] is None for r in rows)
+        assert all(r["Exposure_Basis"] == UNKNOWN_EXPOSURE.basis for r in rows)
+        assert all(r["Risk_Score"] is None for r in rows)
         assert all(r["Population_Density"] is None for r in rows)
+        assert summary["metadata"]["exposure_basis_counts"]["unknown"] == len(rows)
+
+    def test_the_metadata_counts_how_exposure_was_found(self, baseline):
+        counts = baseline["metadata"]["exposure_basis_counts"]
+        assert sum(counts.values()) == baseline["metadata"]["total_nodes"]
+        assert counts["inside"] > counts["nearest"] + counts["unknown"]
 
 
 class TestInconsistentNodes:

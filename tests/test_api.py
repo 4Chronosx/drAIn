@@ -121,6 +121,8 @@ def test_node_rows_carry_the_documented_fields(client):
         "Barangay",
         "Population_Density",
         "Exposure_Score",
+        "Exposure_Basis",
+        "Exposure_Distance_m",
         # The two combined.
         "Risk_Score",
         # The superseded k-means output.

@@ -107,6 +107,33 @@ def point_in_polygon(point: Point, rings: list[Ring]) -> bool:
     return not any(point_in_ring(point, hole) for hole in rings[1:])
 
 
+#: Metres per degree of latitude, and of longitude at the equator.
+_M_PER_DEG_LAT = 110574.0
+_M_PER_DEG_LON = 111320.0
+
+
+def distance_to_rings_m(point: Point, rings: list[Ring]) -> float:
+    """Metres from a point to the nearest edge of a polygon's rings.
+
+    Flat-earth (equirectangular) around the point's latitude: within a
+    kilometre or two, as here, the error is a fraction of a percent.
+    """
+    kx = _M_PER_DEG_LON * math.cos(math.radians(point[1]))
+    ky = _M_PER_DEG_LAT
+    px, py = point[0] * kx, point[1] * ky
+    best = math.inf
+    for ring in rings:
+        for i in range(1, len(ring)):
+            ax, ay = ring[i - 1][0] * kx, ring[i - 1][1] * ky
+            bx, by = ring[i][0] * kx, ring[i][1] * ky
+            dx, dy = bx - ax, by - ay
+            length_sq = dx * dx + dy * dy
+            t = 0.0 if length_sq == 0 else ((px - ax) * dx + (py - ay) * dy) / length_sq
+            t = max(0.0, min(1.0, t))
+            best = min(best, math.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+    return best
+
+
 def bounding_box(rings: list[Ring]) -> tuple[float, float, float, float]:
     """(min_x, min_y, max_x, max_y) of a polygon's outer ring."""
     xs = [position[0] for position in rings[0]]
