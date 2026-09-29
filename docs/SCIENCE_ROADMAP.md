@@ -289,7 +289,7 @@ Live results carry `metadata.model_info`, built from the scorer's own constants.
 - C1: within-barangay validation of hazard, with confirmed reports only.
 - B1: no invented exposure.
 - G1: version stamp.
-- G4: investigate the 89 inconsistent nodes.
+- G4: investigate the 89 inconsistent nodes. Done 2026-09-29: SWMM reporting resolution (1-minute report step, 10-second routing), not our parsing; all 89 rate Low. See `docs/findings/2026-09-29-rpt-vs-out-flooding.md`.
 - F1: accurate claims.
 - Rename or relabel `init_flow` (it sets the flow limit).
 

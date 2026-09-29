@@ -121,8 +121,10 @@ def build_flooding_summary(
 
         # The report's summary table and the binary output disagree for some
         # nodes: the first says the node flooded, the second shows no
-        # positive overflow anywhere in its series. Counted so the mismatch
-        # is visible rather than silently shaping the results.
+        # positive overflow anywhere in its series. SWMM counts flooding at
+        # every routing step but writes the output once a minute, so brief or
+        # flickering overflows miss it (docs/findings/2026-09-29-rpt-vs-out-
+        # flooding.md). Counted so the mismatch is visible.
         if summary.hours_flooded > 0 and feature.time_after_raining_min >= NO_OVERFLOW_MINUTES:
             inconsistent += 1
 
