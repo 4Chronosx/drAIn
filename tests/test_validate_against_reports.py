@@ -6,6 +6,8 @@ flooding, so it needs to be right before anyone reads numbers off it.
 
 from __future__ import annotations
 
+import urllib.error
+
 import pytest
 
 from drain.hazard import categorise
@@ -13,10 +15,16 @@ from scripts.validate_against_reports import (
     HAZARD_RANK,
     PAGE_SIZE,
     Report,
+    auc,
     compare_against_volume_baseline,
     compare_distributions,
     fetch_reports,
+    pooled_auc,
+    print_within_barangay,
+    reporters_per_component,
+    select_reports,
     summarise_join,
+    within_barangay,
 )
 
 
@@ -120,3 +128,79 @@ def test_the_baseline_comparison_can_show_the_model_winning(nodes, capsys):
     compare_against_volume_baseline({"I-5"}, nodes)
     table = parse_top_n_table(capsys.readouterr().out)
     assert table[10] == (1, 1)  # both find it within ten of five nodes
+
+
+# --- Evidence, reporters and the within-barangay comparison (run plan 2.16) ---
+
+
+def test_only_confirmed_reports_and_photo_matches_count_by_default():
+    reports = [
+        Report("I-1", None, None, review_status="confirmed"),
+        Report("I-2", None, None, photo_check="match"),
+        Report("I-3", None, None, review_status="unreviewed", photo_check="missing"),
+    ]
+    kept = select_reports(reports, all_reports=False, min_reporters=1)
+    assert {r.component_id for r in kept} == {"I-1", "I-2"}
+    everything = select_reports(reports, all_reports=True, min_reporters=1)
+    assert len(everything) == 3
+
+
+def test_one_person_reporting_twice_is_one_reporter():
+    reports = [
+        Report("I-1", None, None, user_id="a"),
+        Report("I-1", None, None, user_id="a"),
+        Report("I-1", None, None, user_id="b"),
+        # Signed-out reports can't be told apart: together they are one.
+        Report("I-1", None, None),
+        Report("I-1", None, None),
+        Report("I-2", None, None, user_id="a"),
+    ]
+    assert reporters_per_component(reports) == {"I-1": 3, "I-2": 1}
+    kept = select_reports(reports, all_reports=True, min_reporters=2)
+    assert {r.component_id for r in kept} == {"I-1"}
+
+
+def test_a_key_that_cannot_read_reporters_still_gets_the_reports(capsys):
+    def get_json(url, headers):
+        if "user_id" in url:
+            raise urllib.error.HTTPError(url, 401, "permission denied", None, None)
+        return [{"component_id": "I-1", "review_status": "confirmed"}]
+
+    reports = fetch_reports("https://p.supabase.co", "anon-key", get_json=get_json)
+    assert [r.user_id for r in reports] == [None]
+    assert reports[0].is_strong_evidence
+    assert "can't be told apart" in capsys.readouterr().out
+
+
+def test_auc_is_the_chance_a_reported_node_scores_higher():
+    assert auc([0.9, 0.8], [0.1, 0.2]) == 1.0
+    assert auc([0.1], [0.9]) == 0.0
+    assert auc([0.5], [0.5]) == 0.5
+
+
+def scored(barangay, score):
+    return {"Barangay": barangay, "Vulnerability_Score": score}
+
+
+def test_barangays_with_too_few_reports_say_so():
+    nodes = {f"A-{i}": scored("Alang", i / 10) for i in range(10)}
+    nodes.update({f"B-{i}": scored("Bakilid", i / 10) for i in range(10)})
+    matched = {"A-9", "A-8", "A-7", "A-6", "A-5", "B-9"}
+
+    comparisons = {c.barangay: c for c in within_barangay(matched, nodes, min_sample=5)}
+
+    assert comparisons["Alang"].auc == 1.0  # the five highest are the reported ones
+    assert comparisons["Bakilid"].auc is None  # one reported node is not a sample
+    assert pooled_auc(list(comparisons.values())) == 1.0
+
+
+def test_nodes_without_a_barangay_are_left_out():
+    nodes = {"X": scored(None, 0.9), "A-1": scored("Alang", 0.1)}
+    assert [c.barangay for c in within_barangay({"X"}, nodes)] == ["Alang"]
+
+
+def test_with_no_usable_barangay_there_is_no_pooled_figure(capsys):
+    comparisons = within_barangay({"A-1"}, {"A-1": scored("Alang", 0.5)}, min_sample=5)
+    assert pooled_auc(comparisons) is None
+    print_within_barangay(comparisons, 5)
+    assert "insufficient data" in capsys.readouterr().out
