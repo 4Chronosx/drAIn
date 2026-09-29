@@ -485,3 +485,14 @@ class TestShutdown:
             assert not ran.wait(0.3)
         finally:
             release.set()
+
+
+def test_a_failure_message_keeps_its_meaning_but_not_server_paths():
+    from app.jobs import public_message
+
+    windows = OSError(r"cannot open C:\Users\svc\AppData\Local\Temp\run-1\model.inp")
+    posix = RuntimeError("SWMM failed reading /tmp/drain-x1/model.rpt at line 4")
+    assert public_message(windows) == "cannot open model.inp"
+    assert public_message(posix) == "SWMM failed reading model.rpt at line 4"
+    assert public_message(RuntimeError()) == "RuntimeError"
+    assert public_message(RuntimeError("did not finish in time")) == "did not finish in time"

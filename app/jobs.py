@@ -12,6 +12,7 @@ of the job. See the note in the README before scaling out.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import uuid
 from collections import deque
@@ -23,6 +24,19 @@ from enum import StrEnum
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+#: An absolute path, Windows or POSIX: a server detail, not the caller's
+#: business. The file name alone still says what went wrong.
+_PATH = re.compile(r"(?:[A-Za-z]:)?[\\/](?:[^\s\\/:*?\"<>|]+[\\/])+(?=[^\s\\/]+)")
+
+
+def public_message(error: BaseException) -> str:
+    """What a failed job tells its caller (and the stored run): the error's
+    text with any server paths cut to the file name, or its type if it has
+    no text. The full error, paths included, goes to the log."""
+    text = _PATH.sub("", str(error)).strip()
+    return text or error.__class__.__name__
 
 
 class JobStatus(StrEnum):
@@ -279,7 +293,7 @@ class JobStore:
             # in RUNNING holds a queue slot for the life of the process,
             # because only finished jobs are ever reaped.
             with self._lock:
-                recorded = self._finish(entry, error=str(error) or error.__class__.__name__)
+                recorded = self._finish(entry, error=public_message(error))
             if recorded:
                 logger.exception("Simulation %s failed", job.id)
             else:

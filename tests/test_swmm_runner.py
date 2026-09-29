@@ -89,3 +89,34 @@ class TestBuildPreconfig:
     def test_a_full_day_storm_keeps_the_shipped_end_time(self, recorded):
         updates = recorded({"total_precip": 50, "duration_hr": 24})
         assert not [u for u in updates if u[0] == "OPTIONS"]
+
+
+class TestLinkOverrideMatching:
+    """A key names a conduit by its full name or by the part after the first
+    dash. It used to match by endswith, so "C-88" would also have caught
+    a conduit named ...-C-188."""
+
+    class Link:
+        def __init__(self, linkid):
+            self.linkid = linkid
+            self.flow_limit = None
+
+    def run(self, monkeypatch, names, overrides):
+        from drain import swmm_runner
+
+        links = [self.Link(name) for name in names]
+        monkeypatch.setattr(swmm_runner, "Links", lambda sim: links)
+        swmm_runner._apply_link_overrides(object(), overrides)
+        return {link.linkid: link.flow_limit for link in links}
+
+    def test_the_part_after_the_first_dash_matches_every_segment(self, monkeypatch):
+        limits = self.run(
+            monkeypatch,
+            ["C_0-C-88", "C_1-C-88", "C_2-C-188"],
+            {"C-88": {"init_flow": 0.5}},
+        )
+        assert limits == {"C_0-C-88": 0.5, "C_1-C-88": 0.5, "C_2-C-188": None}
+
+    def test_a_full_name_matches_only_itself(self, monkeypatch):
+        limits = self.run(monkeypatch, ["C_0-C-88", "C_1-C-88"], {"C_1-C-88": {"init_flow": 1.0}})
+        assert limits == {"C_0-C-88": None, "C_1-C-88": 1.0}

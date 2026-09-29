@@ -274,7 +274,9 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(config.allowed_origins),
         allow_origin_regex=config.origin_regex,
-        allow_credentials=True,
+        # No cookies: sign-in travels as a Bearer header, which CORS allows
+        # without credentials mode.
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
         # Browsers hide response headers from scripts unless they are listed

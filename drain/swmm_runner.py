@@ -76,7 +76,13 @@ def _apply_link_overrides(sim: Simulation, overrides: Mapping[str, Mapping[str, 
 
     links = list(Links(sim))
     for suffix, properties in overrides.items():
-        matches = [link for link in links if link.linkid.endswith(suffix)]
+        # Exact: the whole name, or the part after the first dash (C-88 for
+        # C_0-C-88). endswith("88") would also catch ...-C-188.
+        matches = [
+            link
+            for link in links
+            if link.linkid == suffix or link.linkid.split("-", 1)[-1] == suffix
+        ]
         if not matches:
             logger.warning("Ignoring override for unmatched link suffix %r", suffix)
             continue
