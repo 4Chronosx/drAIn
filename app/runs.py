@@ -193,6 +193,11 @@ class SupabaseRunRepository:
 
 _STOP = object()
 
+#: Snapshots waiting to be written. A finished one carries its whole result
+#: (about a megabyte), so a long Supabase outage mustn't grow this without
+#: limit.
+MAX_PENDING_WRITES = 256
+
 
 class RunRecorder:
     """Writes run changes to a repository on one background thread, in order.
@@ -202,9 +207,10 @@ class RunRecorder:
     only puts the snapshot on a queue.
     """
 
-    def __init__(self, repository: RunRepository) -> None:
+    def __init__(self, repository: RunRepository, max_pending: int = MAX_PENDING_WRITES) -> None:
         self._repository = repository
-        self._queue: queue.Queue[object] = queue.Queue()
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
+        self._closed = False
         self._thread = threading.Thread(target=self._drain, name="run-recorder", daemon=True)
         self._thread.start()
 
@@ -216,17 +222,53 @@ class RunRecorder:
         # The request is written once, with the queued row.
         if job.status is not JobStatus.QUEUED:
             job = replace(job, request=None)
-        self._queue.put(job)
+        if self._closed:
+            logger.warning(
+                "Simulation %s became %s after shutdown began; not recorded", job.id, job.status
+            )
+            return
+        # Never block: the job store may be holding its lock.
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            logger.error(
+                "Run recorder is %d writes behind; dropped simulation %s (%s). "
+                "If it was unfinished, the next startup marks it failed.",
+                self._queue.maxsize,
+                job.id,
+                job.status,
+            )
 
     def flush(self, timeout: float = 10.0) -> None:
         """Wait until everything recorded so far has been written."""
         done = threading.Event()
-        self._queue.put(done)
+        self._queue.put(done, timeout=timeout)
         done.wait(timeout)
 
     def close(self, timeout: float = 10.0) -> None:
-        self._queue.put(_STOP)
+        """Write everything recorded so far, then stop.
+
+        Waits up to ``timeout`` seconds. Writes still pending after that are
+        lost with the process, and logged; runs they left looking unfinished
+        are marked failed by the next startup.
+        """
+        self._closed = True
+        try:
+            self._queue.put(_STOP, timeout=timeout)
+        except queue.Full:
+            logger.error(
+                "Run recorder still %d writes behind at shutdown; they were not saved",
+                self._queue.qsize(),
+            )
+            return
         self._thread.join(timeout)
+        if self._thread.is_alive():
+            logger.error(
+                "Run recorder did not finish within %.0f s at shutdown; "
+                "about %d writes were not saved",
+                timeout,
+                self._queue.qsize(),
+            )
 
     def _drain(self) -> None:
         while True:

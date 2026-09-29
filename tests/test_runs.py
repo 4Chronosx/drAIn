@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import replace
@@ -189,6 +190,77 @@ class TestRunRecorder:
         recorder.flush()
         recorder.close()
         assert len(flaky.saves) == 2
+
+
+class TestRunRecorderShutdown:
+    class Slow(MemoryRepository):
+        """Takes a while per write, like Supabase on a bad day."""
+
+        def save(self, job):
+            time.sleep(0.02)
+            super().save(job)
+
+    class Blocked(MemoryRepository):
+        """Doesn't return from a write until released."""
+
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def save(self, job):
+            self.release.wait(5)
+            super().save(job)
+
+    def test_close_writes_everything_recorded_before_it(self):
+        slow = self.Slow()
+        recorder = RunRecorder(slow)
+        for _ in range(5):
+            recorder.record(finished_job())
+        recorder.close()
+        assert len(slow.saves) == 5
+
+    def test_a_write_that_fails_during_shutdown_is_logged(self, caplog):
+        class Down(MemoryRepository):
+            def save(self, job):
+                raise RunStoreError("down")
+
+        recorder = RunRecorder(Down())
+        job = finished_job()
+        recorder.record(job)
+        with caplog.at_level(logging.ERROR, logger="app.runs"):
+            recorder.close()
+        assert any(job.id in record.getMessage() for record in caplog.records)
+
+    def test_writes_left_when_close_gives_up_are_logged(self, caplog):
+        blocked = self.Blocked()
+        recorder = RunRecorder(blocked)
+        recorder.record(finished_job())
+        recorder.record(finished_job())
+        with caplog.at_level(logging.ERROR, logger="app.runs"):
+            recorder.close(timeout=0.2)
+        blocked.release.set()
+        assert any("not saved" in record.getMessage() for record in caplog.records)
+
+    def test_a_change_after_close_is_logged_not_queued(self, caplog):
+        memory = MemoryRepository()
+        recorder = RunRecorder(memory)
+        recorder.close()
+        with caplog.at_level(logging.WARNING, logger="app.runs"):
+            recorder.record(finished_job())
+        assert memory.saves == []
+        assert any("after shutdown" in record.getMessage() for record in caplog.records)
+
+    def test_a_full_queue_drops_and_logs_rather_than_blocking(self, caplog):
+        blocked = self.Blocked()
+        recorder = RunRecorder(blocked, max_pending=1)
+        with caplog.at_level(logging.ERROR, logger="app.runs"):
+            started = time.monotonic()
+            for _ in range(4):
+                recorder.record(finished_job())
+            assert time.monotonic() - started < 1
+        blocked.release.set()
+        recorder.close()
+        assert any("writes behind" in record.getMessage() for record in caplog.records)
 
 
 class FakeAuthByUuid(FakeAuthenticator):
