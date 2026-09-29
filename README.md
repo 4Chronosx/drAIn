@@ -28,7 +28,7 @@
 
 ## 🗺️ Overview
 
-The **drAIn Backend** powers the simulation engine and API infrastructure for the drAIn platform. Built with **FastAPI** and **PySWMM**, it provides RESTful endpoints for running **SWMM (Storm Water Management Model)** hydraulic simulations, processing drainage system data, and delivering real-time flood hazard analytics to the frontend.
+The **drAIn Backend** powers the simulation engine and API infrastructure for the drAIn platform. Built with **FastAPI** and **PySWMM**, it provides RESTful endpoints for running **SWMM (Storm Water Management Model)** hydraulic simulations, processing drainage system data, and returning simulated flood hazard results to the frontend on request. The model has not been calibrated against field records yet (see `docs/SCIENCE_ROADMAP.md`), and every result says so in `metadata.model_info`.
 
 This backend transforms complex hydrological modeling into accessible API services, enabling engineers and planners to run sophisticated urban drainage simulations through simple HTTP requests.
 
@@ -39,7 +39,7 @@ This backend transforms complex hydrological modeling into accessible API servic
 Urban flood modeling typically requires specialized software and technical expertise. The drAIn backend democratizes access to SWMM simulations by:
 
 * **Abstracting Complexity**: Wraps SWMM's Python API in intuitive REST endpoints
-* **Enabling Real-Time Simulation**: Supports interactive "what-if" scenarios for infrastructure planning
+* **Enabling On-Demand Simulation**: Runs "what-if" scenarios for infrastructure planning in the background and returns them when done
 * **Processing at Scale**: Handles data preprocessing and result analysis automatically
 * **Cloud-Ready Architecture**: Deployed on Render for reliable, scalable API access
 

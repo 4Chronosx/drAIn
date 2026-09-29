@@ -226,7 +226,7 @@ What this means for the plan: the largest uncertainties are not in the scoring f
 
 Overclaiming costs credibility with exactly the engineers the tool is for.
 
-**Step 1 (S): accurate claims.**
+**Step 1 (S): accurate claims.** Done 2026-09-29 for the wording (frontend `2b6a0ee`, this repo's README); the `Legacy_Cluster_*` retirement below still waits on D.
 - Describe the system as a physics-based drainage simulation (EPA SWMM) with transparent hazard and exposure scoring, and an AI assistant for questions about the documentation.
 - Audit these places:
   - the frontend landing and docs pages (`app/(main)/docs/sections/*`);
