@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from app.jobs import JobStatus, SimulationJob
+from drain.model_info import network_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,9 @@ class SupabaseRunRepository:
             "finished_at": _iso(job.finished_at),
             "error": job.error,
             "result": _compact(job.result),
+            # Which network file the run used (drain/model_info.py), so old
+            # runs can be told apart after the model changes.
+            "model_version": network_sha256(),
         }
         if job.request is not None:
             row["request"] = job.request

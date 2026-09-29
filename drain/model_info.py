@@ -8,6 +8,7 @@ the ratings are read, without keeping its own copy of the numbers in step.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -37,11 +38,23 @@ def network_built_on(inp_path: Path = BASE_INP) -> str | None:
     return None
 
 
+@lru_cache(maxsize=1)
+def network_sha256(inp_path: Path = BASE_INP) -> str:
+    """A fingerprint of the network file. Two runs with the same one used
+    the same model; any edit to the .inp changes it."""
+    digest = hashlib.sha256()
+    with open(inp_path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def model_info() -> dict[str, Any]:
     """The model's provenance and limits, in a form the app can render."""
     return {
         "network": "Mandaue City drainage network (SWMM)",
         "network_built_on": network_built_on(),
+        "network_sha256": network_sha256(),
         # Nothing here has been checked against measured flood depths or
         # field records of where it floods.
         "calibrated": False,

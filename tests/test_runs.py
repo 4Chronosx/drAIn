@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app.jobs import JobStatus, JobStore, SimulationJob
 from app.main import RESTARTED_MESSAGE, create_app
 from app.runs import RunRecorder, RunStoreError, SupabaseRunRepository
+from drain.model_info import network_sha256
 from tests.test_api import AS_A, AS_B, TEST_SETTINGS, FakeAuthenticator
 
 USER_A = "00000000-0000-4000-a000-00000000000a"
@@ -68,6 +69,7 @@ class TestSupabaseRunRepository:
         assert "resolution=merge-duplicates" in headers["Prefer"]
         assert row["id"] == JOB_ID and row["user_id"] == USER_A
         assert row["status"] == "succeeded"
+        assert row["model_version"] == network_sha256()
 
     def test_the_repeated_nodes_dict_is_not_stored(self):
         fake = FakePostgrest()
