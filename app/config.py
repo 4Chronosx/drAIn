@@ -15,9 +15,15 @@ DEFAULT_ALLOWED_ORIGINS = (
 )
 
 #: Vercel gives every preview deployment a unique hostname, so they cannot be
-#: enumerated. Match them by pattern -- browsers reject a bare "*" when
-#: credentials are allowed.
-DEFAULT_ORIGIN_REGEX = r"https://(pjdsc-drain|project-drain|ai-drain|drain)-[a-z0-9-]+\.vercel\.app"
+#: enumerated. Match them by pattern. Preview hostnames end in the Vercel team
+#: slug (<project>-<hash>-<team>.vercel.app, or <project>-git-<branch>-<team>),
+#: so anchoring on it keeps other people's "drain-*" projects out.
+VERCEL_TEAM_SLUG = "kiloumanjaros-projects"
+DEFAULT_ORIGIN_REGEX = (
+    r"https://(pjdsc-drain|project-drain|ai-drain|drain)-[a-z0-9-]+-"
+    + VERCEL_TEAM_SLUG
+    + r"\.vercel\.app"
+)
 
 
 def _env_list(name: str) -> tuple[str, ...]:

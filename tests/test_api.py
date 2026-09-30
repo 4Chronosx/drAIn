@@ -420,6 +420,33 @@ def test_browsers_may_read_the_polling_headers(client):
     assert {"retry-after", "location"} <= exposed
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://drain-aws7ldd79-kiloumanjaros-projects.vercel.app",
+        "https://drain-git-develop-kiloumanjaros-projects.vercel.app",
+    ],
+)
+def test_our_vercel_previews_may_call_the_api(client, origin):
+    response = client.get("/health", headers={"Origin": origin})
+    assert response.headers.get("access-control-allow-origin") == origin
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # Someone else's project named drain-*, in another Vercel team.
+        "https://drain-aws7ldd79-someone-else.vercel.app",
+        "https://drain-anything.vercel.app",
+        # The slug has to end the hostname, not sit in the middle of it.
+        "https://drain-x-kiloumanjaros-projects-evil.vercel.app",
+    ],
+)
+def test_other_vercel_projects_may_not(client, origin):
+    response = client.get("/health", headers={"Origin": origin})
+    assert "access-control-allow-origin" not in response.headers
+
+
 def test_finished_results_are_compressed_for_clients_that_accept_gzip(client):
     response = client.post("/simulations", json={})
     poll_url = response.json()["poll_url"]

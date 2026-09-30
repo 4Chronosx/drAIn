@@ -192,7 +192,7 @@ All optional; the defaults cover local development and the known deployments.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ALLOWED_ORIGINS` | the production and localhost origins | Comma-separated CORS allowlist |
-| `ALLOWED_ORIGIN_REGEX` | Vercel preview pattern | Matches per-deploy preview hostnames |
+| `ALLOWED_ORIGIN_REGEX` | Vercel preview pattern | Matches preview hostnames of the `kiloumanjaros-projects` Vercel team only |
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
