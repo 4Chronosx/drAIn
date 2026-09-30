@@ -5,23 +5,34 @@ on:
     branches: [main, develop]
   pull_request:
 
+# The workflow only reads the code. Nothing it runs needs to write to the
+# repository, so the token it is handed can't.
+permissions:
+  contents: read
+
 jobs:
   quality:
     name: Lint & Tests
     runs-on: ubuntu-latest
     steps:
+      # Actions are pinned to a commit, not a tag: a tag can be moved to
+      # different code after the fact, a commit can't.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           # Matches the version the dependencies are pinned against.
           python-version: '3.12'
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        # Every package is pinned and hashed, so a changed or substituted
+        # download fails the install instead of running.
+        run: pip install --require-hashes -r requirements-dev.txt
 
       - name: Check formatting
         run: ruff format --check app drain tests scripts

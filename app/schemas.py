@@ -20,6 +20,12 @@ _STRICT = ConfigDict(allow_inf_nan=False, extra="forbid")
 #: A node or link id, as the network names it (e.g. I-4, C-88).
 ComponentId = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
+#: The most overrides one request may carry. The network has 1,413 nodes and
+#: 1,570 conduits, so a request touching every one fits; a bigger one is
+#: refused before its entries are validated one by one.
+MAX_NODE_OVERRIDES = 2_000
+MAX_LINK_OVERRIDES = 2_000
+
 
 class NodeOverride(BaseModel):
     """Per-node property overrides applied before the simulation runs."""
@@ -77,8 +83,12 @@ class SimulationRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    nodes: dict[ComponentId, NodeOverride] = Field(default_factory=dict)
-    links: dict[ComponentId, LinkOverride] = Field(default_factory=dict)
+    nodes: dict[ComponentId, NodeOverride] = Field(
+        default_factory=dict, max_length=MAX_NODE_OVERRIDES
+    )
+    links: dict[ComponentId, LinkOverride] = Field(
+        default_factory=dict, max_length=MAX_LINK_OVERRIDES
+    )
     rainfall: RainfallSpec | None = None
 
     @model_validator(mode="before")

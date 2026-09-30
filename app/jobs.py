@@ -106,6 +106,10 @@ class _Entry:
 class JobStore:
     """Runs simulations on a small thread pool and remembers the results.
 
+    Finished results are kept by reference: jobs for the unmodified network
+    all hold the one shared baseline (:func:`app.simulation.baseline_result`)
+    rather than a copy each.
+
     Finished jobs are kept for ``retention`` so a client that polls slowly
     still sees the outcome, then dropped: each result is close to a megabyte
     of JSON, so holding them indefinitely would leak the process's memory.
@@ -115,6 +119,8 @@ class JobStore:
     taking the jobs still queued with it; the hung thread is left to finish
     or not on its own, and whatever it returns is ignored. Without that, one
     hung run held the only worker and everything behind it waited forever.
+    The server runs each SWMM run in a child process (:mod:`app.isolation`)
+    that is killed at the same limit, so in practice the thread is freed too.
     """
 
     def __init__(
@@ -127,6 +133,7 @@ class JobStore:
         max_jobs_per_owner: int | None = None,
         max_runs_per_owner_per_hour: int | None = None,
         listener: Callable[[SimulationJob], None] | None = None,
+        max_jobs_per_group: int | None = None,
     ) -> None:
         self._max_workers = max_workers
         self._executor = self._new_executor()
@@ -139,6 +146,10 @@ class JobStore:
         self._max_jobs_per_owner = max_jobs_per_owner
         self._max_runs_per_owner_per_hour = max_runs_per_owner_per_hour
         self._recent_runs: dict[str, deque[datetime]] = {}
+        # Nor should one address cycling through accounts. A job's group is
+        # the address that submitted it.
+        self._max_jobs_per_group = max_jobs_per_group
+        self._groups: dict[str, str] = {}
         # Told of every change (queued, started, finished), with a snapshot.
         # Called while holding the lock, so it must not block.
         self._listener = listener
@@ -153,15 +164,21 @@ class JobStore:
         work: Callable[[], dict[str, Any]],
         owner: str | None = None,
         request: dict[str, Any] | None = None,
+        group: str | None = None,
+        prior_runs: int | None = None,
     ) -> SimulationJob:
         """Queue a simulation, or raise :class:`QueueFullError`.
 
         The cap counts work that has not finished yet. It is what stops a
         burst of requests from growing an unbounded backlog that nobody is
         still waiting on. An ``owner`` is also held to their own allowance
-        (:class:`UserLimitError`).
+        (:class:`UserLimitError`), and a ``group`` to its share of the queue.
+
+        ``prior_runs`` is how many runs the owner started in the past hour
+        by an outside count (the run table). This process forgets its own
+        count when it restarts, so the larger of the two is used.
         """
-        _, accepted = self._enqueue(work, owner, request)
+        _, accepted = self._enqueue(work, owner, request, group, prior_runs)
         return accepted
 
     def get(self, job_id: str) -> SimulationJob | None:
@@ -202,6 +219,8 @@ class JobStore:
         work: Callable[[], dict[str, Any]],
         owner: str | None = None,
         request: dict[str, Any] | None = None,
+        group: str | None = None,
+        prior_runs: int | None = None,
     ) -> tuple[_Entry, SimulationJob]:
         """Queue work. Returns its entry and a snapshot of the job as accepted."""
         with self._lock:
@@ -209,7 +228,9 @@ class JobStore:
                 raise JobStoreClosedError("The simulation service is shutting down.")
             self._drop_expired()
             if owner is not None:
-                self._check_owner_allowance(owner)
+                self._check_owner_allowance(owner, prior_runs or 0)
+            if group is not None:
+                self._check_group_allowance(group)
             outstanding = self._outstanding()
             if outstanding >= self._max_queued:
                 raise QueueFullError(f"{outstanding} simulations are already queued or running.")
@@ -221,6 +242,8 @@ class JobStore:
             if owner is not None:
                 self._recent_runs.setdefault(owner, deque()).append(entry.job.created_at)
             self._entries[entry.job.id] = entry
+            if group is not None:
+                self._groups[entry.job.id] = group
             accepted = replace(entry.job)
             # Before dispatch, so "queued" is reported before "running".
             self._notify(entry.job)
@@ -233,7 +256,22 @@ class JobStore:
         """Caller holds the lock."""
         return sum(1 for entry in self._entries.values() if not entry.job.is_finished)
 
-    def _check_owner_allowance(self, owner: str) -> None:
+    def _check_group_allowance(self, group: str) -> None:
+        """Refuse a group at its limit. Caller holds the lock."""
+        if self._max_jobs_per_group is None:
+            return
+        held = sum(
+            1
+            for job_id, member in self._groups.items()
+            if member == group and not self._entries[job_id].job.is_finished
+        )
+        if held >= self._max_jobs_per_group:
+            raise UserLimitError(
+                "Too many simulations are already queued or running from your network. "
+                "Wait for one to finish."
+            )
+
+    def _check_owner_allowance(self, owner: str, prior_runs: int = 0) -> None:
         """Refuse an owner at their limit. Caller holds the lock."""
         if self._max_jobs_per_owner is not None:
             mine = sum(
@@ -254,9 +292,10 @@ class JobStore:
                 recent.popleft()
             if recent is not None and not recent:
                 del self._recent_runs[owner]
-            elif recent is not None and len(recent) >= self._max_runs_per_owner_per_hour:
+            started = max(len(recent or ()), prior_runs)
+            if started >= self._max_runs_per_owner_per_hour:
                 raise UserLimitError(
-                    f"You have started {len(recent)} simulations in the past hour, "
+                    f"You have started {started} simulations in the past hour, "
                     "the most allowed. Try again later."
                 )
 
@@ -389,6 +428,7 @@ class JobStore:
         ]
         for job_id in expired:
             del self._entries[job_id]
+            self._groups.pop(job_id, None)
         if expired:
             logger.debug("Dropped %d expired simulation results", len(expired))
 

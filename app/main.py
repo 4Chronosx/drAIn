@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -11,7 +12,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
+from app import isolation
 from app.auth import (
+    AccountRefusedError,
     Authenticator,
     AuthUnavailableError,
     Caller,
@@ -27,12 +30,29 @@ from app.jobs import (
     UserLimitError,
 )
 from app.logging_config import configure_logging
-from app.runs import RunRecorder, RunRepository, RunStoreError, SupabaseRunRepository
+from app.middleware import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+    client_ip,
+)
+from app.polling import (
+    FINISHED_CACHE_CONTROL,
+    FINISHED_VARY,
+    RenderedState,
+    RenderedStates,
+    render,
+)
+from app.runs import (
+    RunRecorder,
+    RunRepository,
+    RunStoreError,
+    SupabaseRunRepository,
+    is_uuid,
+)
 from app.schemas import HealthResponse, JobAccepted, JobState, SimulationRequest
-from drain.flooding import build_flooding_summary
-from drain.hazard import DEFAULT_EVENT_HOURS
+from app.simulation import baseline_result, is_unmodified, simulate, simulate_payload
 from drain.network import link_suffixes, node_ids
-from drain.swmm_runner import run_simulation
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +91,7 @@ def _build_job_store(config: Settings, listener=None) -> JobStore:
         max_jobs_per_owner=config.max_jobs_per_user,
         max_runs_per_owner_per_hour=config.max_runs_per_user_per_hour,
         listener=listener,
+        max_jobs_per_group=config.max_jobs_per_ip,
     )
 
 
@@ -84,7 +105,11 @@ def _build_authenticator(config: Settings) -> Authenticator | None:
         logger.warning("REQUIRE_AUTH is off: anyone can run simulations. Local development only.")
         return OpenAuthenticator()
     if config.supabase_url and config.supabase_anon_key:
-        return SupabaseAuthenticator(config.supabase_url, config.supabase_anon_key)
+        return SupabaseAuthenticator(
+            config.supabase_url,
+            config.supabase_anon_key,
+            require_confirmed_email=config.require_confirmed_email,
+        )
     logger.error(
         "SUPABASE_URL and SUPABASE_ANON_KEY are not set, so nobody can be signed in; "
         "simulation requests will be refused."
@@ -113,33 +138,50 @@ def _reject_unknown_ids(request: SimulationRequest) -> None:
 
 
 def _simulate(request: SimulationRequest) -> dict[str, Any]:
-    """Run one simulation to completion. Executed on a worker thread."""
-    rainfall = request.rainfall_spec()
+    """Run one simulation to completion, in this process.
 
-    # Hazard scores duration as a share of the event, so the scorer needs
-    # the storm's real length. Without it a 40-minute flood in a one-hour
-    # storm reads as 3% of a day rather than two thirds of the event.
-    event_hours = float(rainfall.get("duration_hr") or DEFAULT_EVENT_HOURS)
-
-    with run_simulation(
-        nodes=request.node_overrides(),
-        links=request.link_overrides(),
-        rainfall=rainfall,
-    ) as (rpt_path, out_path):
-        summary = build_flooding_summary(rpt_path, out_path, event_hours=event_hours)
-    return served(summary)
-
-
-def served(summary: dict[str, Any]) -> dict[str, Any]:
-    """What the API sends for a finished run: each node once, in nodes_list.
-
-    build_flooding_summary also keys every node by id (nodes_dict) for the
-    CLI and scripts. Sent as well, it doubled the payload: 1.39 MB against
-    0.70 MB, or 40 KB against 21 KB gzipped, for the baseline. No client
-    used it.
+    The unmodified network is answered from the shared baseline, built once
+    from the shipped results; every job asking for it holds that one object
+    rather than a 0.7 MB copy of its own.
     """
-    metadata = {k: v for k, v in summary["metadata"].items() if k != "structure_info"}
-    return {**{k: v for k, v in summary.items() if k != "nodes_dict"}, "metadata": metadata}
+    if is_unmodified(request):
+        return baseline_result()
+    return simulate(request)
+
+
+def _work_for(request: SimulationRequest, config: Settings) -> Callable[[], dict[str, Any]]:
+    """What a worker thread runs for this request.
+
+    A real simulation runs in a child process that is killed once it passes
+    ``max_runtime_seconds`` (:mod:`app.isolation`), rather than left burning
+    a core after the job store gave up on it. The baseline needs no SWMM, so
+    it stays in this process, where it is shared.
+    """
+    if config.isolate_simulations and not is_unmodified(request):
+        payload = request.model_dump(exclude_none=True)
+        timeout = float(config.max_runtime_seconds)
+        return lambda: isolation.run_isolated(simulate_payload, payload, timeout)
+    return lambda: _simulate(request)
+
+
+def _recent_runs(repository: RunRepository | None, owner: str, config: Settings) -> int | None:
+    """How many runs the run table says ``owner`` started in the past hour.
+
+    The job store's own count starts from zero after every restart, which
+    handed everyone a fresh allowance. ``None`` when there is no table or it
+    can't be read in time; the store's own count then stands alone.
+    """
+    if repository is None or not is_uuid(owner):
+        return None
+    try:
+        return repository.count_recent(
+            owner,
+            since=datetime.now(UTC) - timedelta(hours=1),
+            limit=config.max_runs_per_user_per_hour,
+        )
+    except RunStoreError:
+        logger.warning("Could not count recent runs for %s; using this process's count", owner)
+        return None
 
 
 def _as_state(job: SimulationJob) -> JobState:
@@ -152,6 +194,30 @@ def _as_state(job: SimulationJob) -> JobState:
         result=job.result,
         error=job.error,
     )
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="No such simulation. It may have expired.",
+    )
+
+
+def _finished_response(finished: RenderedState, request: Request) -> Response:
+    """A finished job's response: 304 if the client already has it, else the
+    body, gzipped if the client takes that."""
+    gzipped = "gzip" in request.headers.get("accept-encoding", "")
+    headers = {
+        "ETag": finished.etag_for(gzipped),
+        "Cache-Control": FINISHED_CACHE_CONTROL,
+        "Vary": FINISHED_VARY,
+    }
+    if finished.matches(request.headers.get("if-none-match")):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    if gzipped:
+        headers["Content-Encoding"] = "gzip"
+        return Response(finished.gzipped, media_type="application/json", headers=headers)
+    return Response(finished.body(), media_type="application/json", headers=headers)
 
 
 def _queue_full(error: QueueFullError) -> HTTPException:
@@ -176,7 +242,7 @@ def _shutting_down(error: JobStoreClosedError) -> HTTPException:
 
 
 def current_caller(request: Request) -> Caller:
-    """The signed-in person making the request, or a 401/503.
+    """The signed-in person making the request, or a 401/403/503.
 
     Reads the app's authenticator from ``app.state`` (set by
     :func:`create_app`), so tests can build an app with their own.
@@ -206,6 +272,8 @@ def current_caller(request: Request) -> Caller:
             detail="Could not check your sign-in. Try again shortly.",
             headers={"Retry-After": str(POLL_INTERVAL_SECONDS)},
         ) from None
+    except AccountRefusedError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from None
     if caller is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -231,6 +299,7 @@ def create_app(
     repository = runs if runs is not None else _build_run_repository(config)
     recorder = RunRecorder(repository) if repository is not None else None
     jobs = _build_job_store(config, listener=recorder.record if recorder else None)
+    rendered = RenderedStates(ttl_seconds=config.result_retention_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -247,6 +316,7 @@ def create_app(
                 logger.exception("Could not tidy recorded simulation runs")
         yield
         jobs.shutdown()
+        isolation.kill_all()
         if recorder is not None:
             recorder.close()
 
@@ -259,13 +329,33 @@ def create_app(
             "Supabase access token as a Bearer token."
         ),
         lifespan=lifespan,
+        # Off unless ENABLE_DOCS is set: the schema is a map for whoever is
+        # probing the API, and the app doesn't read it.
+        docs_url="/docs" if config.enable_docs else None,
+        redoc_url="/redoc" if config.enable_docs else None,
+        openapi_url="/openapi.json" if config.enable_docs else None,
     )
     app.state.authenticator = auth
 
+    # Middleware added last runs first. From the outside in: security
+    # headers on everything; CORS, so a browser can read even a refusal
+    # made below it; the per-address rate limit and the body size limit,
+    # both before a body is read or a sign-in checked; then gzip.
+    #
+    # A finished run's result is about 0.7 MB of JSON, 40 KB gzipped. It is
+    # compressed once (app.polling) and passes through gzip untouched.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=config.max_request_bytes)
+    app.add_middleware(
+        RateLimitMiddleware,
+        submit_per_minute=config.submit_rate_per_minute,
+        poll_per_minute=config.poll_rate_per_minute,
+        proxy_hops=config.trusted_proxy_hops,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(config.allowed_origins),
-        allow_origin_regex=config.origin_regex,
+        allow_origin_regex=config.origin_regex or None,
         # No cookies: sign-in travels as a Bearer header, which CORS allows
         # without credentials mode.
         allow_credentials=False,
@@ -275,9 +365,7 @@ def create_app(
         # here, and the polling client needs both.
         expose_headers=["Retry-After", "Location"],
     )
-    # A finished run's result is about 1.1 MB of JSON, sent to every poll
-    # once it is done. Gzipped it is about 40 KB.
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(SecurityHeadersMiddleware)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -293,6 +381,7 @@ def create_app(
         request: SimulationRequest,
         response: Response,
         caller: SignedIn,
+        http_request: Request,
     ) -> JobAccepted:
         """Queue a simulation and return where to poll for its result.
 
@@ -300,17 +389,21 @@ def create_app(
         and platform proxies keep a request open -- so the result is
         collected from ``GET /simulations/{job_id}``.
 
-        Returns 401 without a valid sign-in, 422 for an override the network
-        can't take, 429 when the caller already has a run going or has used
-        their hourly allowance, or the server is full, and 503 while the
-        server is shutting down.
+        Returns 401 without a valid sign-in, 403 for an account without a
+        confirmed email, 413 for a body over the size limit, 422 for an
+        override the network can't take, 429 when the caller already has a
+        run going or has used their hourly allowance, their address is
+        sending too much or has too many runs waiting, or the server is
+        full, and 503 while the server is shutting down.
         """
         _reject_unknown_ids(request)
         try:
             job = jobs.submit(
-                lambda: _simulate(request),
+                _work_for(request, config),
                 owner=caller.user_id,
                 request=request.model_dump(exclude_none=True),
+                group=client_ip(http_request.scope, config.trusted_proxy_hops),
+                prior_runs=_recent_runs(repository, caller.user_id, config),
             )
         except QueueFullError as error:
             raise _queue_full(error) from None
@@ -327,29 +420,42 @@ def create_app(
         job_id: str,
         response: Response,
         caller: SignedIn,
-    ) -> JobState:
+        http_request: Request,
+    ) -> Any:
         """Report a queued simulation's progress, and its result once done.
 
         Returns 404 once a finished job's result has expired, so a client
         that stops polling and comes back much later is told plainly rather
         than handed an empty success. Someone else's job is a 404 too.
-        """
-        job = jobs.get(job_id)
-        if job is None and repository is not None:
-            # Gone from memory -- expired, or a restart -- but recorded.
-            try:
-                job = repository.load(job_id)
-            except RunStoreError:
-                logger.exception("Could not read simulation %s back from Supabase", job_id)
-        if job is None or job.owner != caller.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No such simulation. It may have expired.",
-            )
 
-        if not job.is_finished:
-            response.headers["Retry-After"] = str(POLL_INTERVAL_SECONDS)
-        return _as_state(job)
+        A finished job's response carries an ETag; sending it back in
+        ``If-None-Match`` gets a bodiless 304 instead of the result again.
+        """
+        finished = rendered.get(job_id)
+        if finished is None:
+            job = jobs.get(job_id)
+            if job is None and repository is not None and not rendered.is_unknown(job_id):
+                # Gone from memory -- expired, or a restart -- but recorded.
+                try:
+                    job = repository.load(job_id)
+                except RunStoreError:
+                    logger.exception("Could not read simulation %s back from Supabase", job_id)
+                else:
+                    if job is None:
+                        # Asked again within seconds, the answer is the same.
+                        rendered.mark_unknown(job_id)
+            if job is None or job.owner != caller.user_id:
+                raise _not_found()
+            if not job.is_finished:
+                response.headers["Retry-After"] = str(POLL_INTERVAL_SECONDS)
+                return _as_state(job)
+            # A finished job never changes, so its response is built once.
+            finished = render(job)
+            rendered.put(job_id, finished)
+
+        if finished.owner != caller.user_id:
+            raise _not_found()
+        return _finished_response(finished, http_request)
 
     return app
 

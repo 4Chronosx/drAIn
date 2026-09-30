@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import replace
@@ -9,10 +10,14 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 
-from app.auth import AuthUnavailableError, Caller
-from app.config import settings
+from app import polling as app_polling
+from app.auth import AccountRefusedError, AuthUnavailableError, Caller
+from app.config import VERCEL_PREVIEW_ORIGIN_REGEX, settings
 from app.main import create_app
+from app.schemas import MAX_NODE_OVERRIDES, SimulationRequest
+from app.simulation import baseline_result, is_baseline
 from drain.flooding import build_flooding_summary as flooding_summary_for_test
+from drain.network import link_suffixes, node_ids
 
 #: Two known users; any other token is invalid.
 USERS = {"token-a": Caller("user-a"), "token-b": Caller("user-b")}
@@ -28,13 +33,19 @@ class BrokenAuthenticator:
         raise AuthUnavailableError("Supabase is down")
 
 
-#: Generous per-user limits, so tests that queue several runs aren't held
-#: back by them. The tests of the limits set their own.
+#: Generous per-user and per-address limits, so tests that queue several
+#: runs and poll quickly aren't held back by them. The tests of the limits
+#: set their own. Simulations run in-process so tests can stub them;
+#: tests/test_isolation.py covers the child process.
 TEST_SETTINGS = replace(
     settings,
     require_auth=True,
     max_jobs_per_user=100,
     max_runs_per_user_per_hour=1000,
+    max_jobs_per_ip=100,
+    submit_rate_per_minute=0,
+    poll_rate_per_minute=0,
+    isolate_simulations=False,
 )
 
 AS_A = {"Authorization": "Bearer token-a"}
@@ -51,6 +62,15 @@ def make_app(authenticator=None, **overrides):
 @pytest.fixture(scope="module")
 def client():
     with TestClient(make_app(), headers=AS_A) as test_client:
+        yield test_client
+
+
+@pytest.fixture(scope="module")
+def preview_client():
+    """A client for a server that lets Vercel previews in, as one does with
+    ALLOWED_ORIGIN_REGEX set to the preview pattern."""
+    app = make_app(origin_regex=VERCEL_PREVIEW_ORIGIN_REGEX)
+    with TestClient(app, headers=AS_A) as test_client:
         yield test_client
 
 
@@ -149,7 +169,7 @@ def test_a_request_during_shutdown_is_a_503_not_a_crash():
 def test_the_deprecated_synchronous_endpoint_is_gone(client):
     """It held a request open for the whole run and had no sign-in."""
     assert client.post("/run-simulation", json={}).status_code in {404, 405}
-    assert "/run-simulation" not in client.get("/openapi.json").json()["paths"]
+    assert "/run-simulation" not in client.app.openapi()["paths"]
 
 
 class TestSignIn:
@@ -310,8 +330,8 @@ class TestQueuedSimulations:
         def explode(*args, **kwargs):
             raise RuntimeError("SWMM exploded")
 
-        monkeypatch.setattr("app.main.run_simulation", explode)
-        finished = run(client, {})
+        monkeypatch.setattr("app.simulation.run_simulation", explode)
+        finished = run(client, {"rainfall": {"total_precip": 10, "duration_hr": 1}})
 
         assert finished["status"] == "failed"
         assert finished["result"] is None
@@ -402,7 +422,7 @@ class TestEventDurationReachesTheScorer:
             captured["event_hours"] = kwargs.get("event_hours")
             return real(rpt_path, out_path, *args, **kwargs)
 
-        monkeypatch.setattr("app.main.build_flooding_summary", spy)
+        monkeypatch.setattr("app.simulation.build_flooding_summary", spy)
         run(client, {"rainfall": {"total_precip": 0, "duration_hr": 2}})
         assert captured["event_hours"] == 2.0
 
@@ -427,8 +447,20 @@ def test_browsers_may_read_the_polling_headers(client):
         "https://drain-git-develop-kiloumanjaros-projects.vercel.app",
     ],
 )
-def test_our_vercel_previews_may_call_the_api(client, origin):
+def test_our_vercel_previews_are_refused_by_default(client, origin):
     response = client.get("/health", headers={"Origin": origin})
+    assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://drain-aws7ldd79-kiloumanjaros-projects.vercel.app",
+        "https://drain-git-develop-kiloumanjaros-projects.vercel.app",
+    ],
+)
+def test_our_vercel_previews_may_call_the_api_when_allowed(preview_client, origin):
+    response = preview_client.get("/health", headers={"Origin": origin})
     assert response.headers.get("access-control-allow-origin") == origin
 
 
@@ -442,8 +474,8 @@ def test_our_vercel_previews_may_call_the_api(client, origin):
         "https://drain-x-kiloumanjaros-projects-evil.vercel.app",
     ],
 )
-def test_other_vercel_projects_may_not(client, origin):
-    response = client.get("/health", headers={"Origin": origin})
+def test_other_vercel_projects_may_not(preview_client, origin):
+    response = preview_client.get("/health", headers={"Origin": origin})
     assert "access-control-allow-origin" not in response.headers
 
 
@@ -458,3 +490,269 @@ def test_finished_results_are_compressed_for_clients_that_accept_gzip(client):
 
     plain = client.get(poll_url, headers={"Accept-Encoding": "identity"})
     assert "content-encoding" not in plain.headers
+
+
+class TestRequestSize:
+    """FastAPI reads the whole body before the sign-in check, so without a
+    cap anyone could make the server hold and parse as much as they sent."""
+
+    def test_a_declared_oversized_body_is_refused_unread(self):
+        with TestClient(make_app(max_request_bytes=1000), headers=AS_A) as small:
+            response = small.post(
+                "/simulations",
+                content=b"{" + b" " * 2000 + b"}",
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 413
+
+    def test_a_streamed_body_is_cut_off_at_the_limit(self):
+        def chunks():
+            yield b'{"nodes": {'
+            for _ in range(100):
+                yield b" " * 100
+
+        with TestClient(make_app(max_request_bytes=1000), headers=AS_A) as small:
+            response = small.post(
+                "/simulations", content=chunks(), headers={"Content-Type": "application/json"}
+            )
+        assert response.status_code == 413
+
+    def test_the_largest_real_request_fits_the_default(self):
+        # Every node and link, every field, long floats: what the limit is
+        # sized from.
+        long = 1.2345678901234567
+        node = dict.fromkeys(("inv_elev", "init_depth", "surcharge_depth"), long)
+        link = dict.fromkeys(
+            ("init_flow", "upstrm_offset_depth", "downstrm_offset_depth", "avg_conduit_loss"),
+            long,
+        )
+        payload = {
+            "nodes": {n: {**node, "ponding_area": 1234.5678901234567} for n in node_ids()},
+            "links": dict.fromkeys(link_suffixes(), link),
+            "rainfall": {"total_precip": 1234.5678901234567, "duration_hr": 23.456789012345678},
+        }
+        body = json.dumps(payload, indent=2).encode()
+        assert len(body) < settings.max_request_bytes
+        request = SimulationRequest.model_validate(payload)
+        assert len(request.nodes) == len(node_ids())
+
+    def test_more_overrides_than_the_network_could_have_are_refused(self, client):
+        payload = {"nodes": {f"I-{n}": {} for n in range(MAX_NODE_OVERRIDES + 1)}}
+        assert client.post("/simulations", json=payload).status_code == 422
+
+
+class TestRateLimits:
+    """Per client address, checked before any body is read or sign-in asked."""
+
+    def test_starting_runs_is_limited_per_address(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        with TestClient(make_app(submit_rate_per_minute=2), headers=AS_A) as limited:
+            for _ in range(2):
+                assert limited.post("/simulations", json={}).status_code == 202
+            refused = limited.post("/simulations", json={})
+        assert refused.status_code == 429
+        assert int(refused.headers["retry-after"]) >= 1
+
+    def test_polling_is_limited_separately(self):
+        with TestClient(make_app(poll_rate_per_minute=3), headers=AS_A) as limited:
+            codes = [limited.get("/simulations/nope").status_code for _ in range(4)]
+            assert codes == [404, 404, 404, 429]
+            assert limited.post("/simulations", json={}).status_code == 202
+
+    def test_made_up_tokens_count_too(self):
+        """They are what the limit is for."""
+        with TestClient(make_app(poll_rate_per_minute=1)) as limited:
+            forged = {"Authorization": "Bearer forged"}
+            assert limited.get("/simulations/x", headers=forged).status_code == 401
+            assert limited.get("/simulations/x", headers=forged).status_code == 429
+
+    def test_behind_a_proxy_each_forwarded_address_has_its_own_limit(self):
+        app = make_app(poll_rate_per_minute=1, trusted_proxy_hops=1)
+        with TestClient(app, headers=AS_A) as limited:
+            first = {"X-Forwarded-For": "203.0.113.1"}
+            second = {"X-Forwarded-For": "203.0.113.2"}
+            assert limited.get("/simulations/x", headers=first).status_code == 404
+            assert limited.get("/simulations/x", headers=first).status_code == 429
+            assert limited.get("/simulations/x", headers=second).status_code == 404
+
+    def test_a_caller_cannot_choose_their_forwarded_address(self):
+        # The proxy appends the address it saw; whatever the caller wrote
+        # before it is ignored.
+        app = make_app(poll_rate_per_minute=1, trusted_proxy_hops=1)
+        with TestClient(app, headers=AS_A) as limited:
+            real = "198.51.100.7"
+            spoofed = {"X-Forwarded-For": f"203.0.113.1, {real}"}
+            respoofed = {"X-Forwarded-For": f"203.0.113.9, {real}"}
+            assert limited.get("/simulations/x", headers=spoofed).status_code == 404
+            assert limited.get("/simulations/x", headers=respoofed).status_code == 429
+
+    def test_without_trusted_proxies_the_header_is_ignored(self):
+        with TestClient(make_app(poll_rate_per_minute=1), headers=AS_A) as limited:
+            first = limited.get("/simulations/x", headers={"X-Forwarded-For": "192.0.2.1"})
+            second = limited.get("/simulations/x", headers={"X-Forwarded-For": "192.0.2.2"})
+        assert (first.status_code, second.status_code) == (404, 429)
+
+    def test_health_is_not_limited(self):
+        with TestClient(make_app(poll_rate_per_minute=1, submit_rate_per_minute=1)) as limited:
+            assert all(limited.get("/health").status_code == 200 for _ in range(5))
+
+
+class TestPerAddressQueueShare:
+    def test_one_address_cannot_fill_the_queue_with_several_accounts(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = make_app(max_jobs_per_user=1, max_jobs_per_ip=1)
+        try:
+            with TestClient(app) as shared:
+                assert shared.post("/simulations", json={}, headers=AS_A).status_code == 202
+                refused = shared.post("/simulations", json={}, headers=AS_B)
+                assert refused.status_code == 429
+                assert "your network" in refused.json()["detail"]
+        finally:
+            release.set()
+
+
+class TestAccountChecks:
+    def test_an_account_the_server_refuses_is_a_403(self):
+        class Refusing:
+            def authenticate(self, token):
+                raise AccountRefusedError("Confirm your email address before running simulations.")
+
+        with TestClient(make_app(Refusing()), headers=AS_A) as refused:
+            response = refused.post("/simulations", json={})
+        assert response.status_code == 403
+        assert "Confirm your email" in response.json()["detail"]
+
+
+class TestApiDocs:
+    @pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+    def test_docs_are_off_by_default(self, client, path):
+        assert client.get(path).status_code == 404
+
+    def test_docs_can_be_turned_on(self):
+        with TestClient(make_app(enable_docs=True)) as documented:
+            assert documented.get("/docs").status_code == 200
+            assert "/simulations" in documented.get("/openapi.json").json()["paths"]
+
+
+class TestResponseHeaders:
+    def test_every_response_says_not_to_sniff_or_store(self, client):
+        response = client.post("/simulations", json={})
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_a_refusal_from_middleware_gets_them_too(self):
+        with TestClient(make_app(max_request_bytes=10), headers=AS_A) as small:
+            response = small.post("/simulations", json={"nodes": {}, "links": {}})
+        assert response.status_code == 413
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+class TestFinishedResultsAreCached:
+    """A finished result is 0.7 MB, polled every few seconds. It used to be
+    rebuilt, serialised and gzipped again for every poll."""
+
+    def finished(self, client):
+        poll_url = client.post("/simulations", json={}).json()["poll_url"]
+        poll_until_finished(client, poll_url)
+        return poll_url
+
+    def test_a_finished_result_has_an_etag_and_answers_304(self, client):
+        poll_url = self.finished(client)
+        first = client.get(poll_url)
+        etag = first.headers["etag"]
+        assert first.headers["cache-control"] == "private, no-cache"
+
+        again = client.get(poll_url, headers={"If-None-Match": etag})
+        assert again.status_code == 304
+        assert again.content == b""
+        assert again.headers["etag"] == etag
+
+    def test_the_etag_differs_by_encoding(self, client):
+        poll_url = self.finished(client)
+        zipped = client.get(poll_url, headers={"Accept-Encoding": "gzip"})
+        plain = client.get(poll_url, headers={"Accept-Encoding": "identity"})
+        assert zipped.headers["etag"] != plain.headers["etag"]
+        assert zipped.json() == plain.json()
+
+    def test_a_cached_result_is_still_only_its_owners(self, client):
+        poll_url = self.finished(client)
+        etag = client.get(poll_url).headers["etag"]
+        assert client.get(poll_url, headers=AS_B).status_code == 404
+        assert client.get(poll_url, headers={**AS_B, "If-None-Match": etag}).status_code == 404
+
+    def test_an_unfinished_job_is_not_cached(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        try:
+            with TestClient(make_app(), headers=AS_A) as slow:
+                poll_url = slow.post("/simulations", json={}).json()["poll_url"]
+                response = slow.get(poll_url)
+                assert "etag" not in response.headers
+                assert response.headers["cache-control"] == "no-store"
+        finally:
+            release.set()
+
+    def test_the_result_is_serialised_once(self, client, monkeypatch):
+        poll_url = self.finished(client)
+        client.get(poll_url)
+        calls = []
+        real = app_polling.render
+        monkeypatch.setattr("app.main.render", lambda job: calls.append(job) or real(job))
+        for _ in range(3):
+            assert client.get(poll_url).status_code == 200
+        assert calls == []
+
+    def test_unmodified_runs_share_one_result(self, client):
+        first = self.finished(client)
+        second = self.finished(client)
+        a, b = (client.get(url).json() for url in (first, second))
+        assert a["result"] == b["result"]
+        assert a["job_id"] != b["job_id"]
+        assert is_baseline(baseline_result())
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # A stranger's project named "drain-x-kiloumanjaros-projects" gets
+        # this hostname. The old pattern let it in.
+        "https://drain-x-kiloumanjaros-projects.vercel.app",
+        "https://evil-kiloumanjaros-projects.vercel.app",
+        "https://drain-kiloumanjaros-projects.vercel.app",
+        "https://drain-abc-kiloumanjaros-projects.vercel.app",
+        "https://drain-aws7ldd79x-kiloumanjaros-projects.vercel.app",
+        "https://notdrain-aws7ldd79-kiloumanjaros-projects.vercel.app",
+        "https://drain-git--kiloumanjaros-projects.vercel.app",
+        "http://drain-aws7ldd79-kiloumanjaros-projects.vercel.app",
+    ],
+)
+def test_lookalike_hostnames_in_our_team_slug_may_not(preview_client, origin):
+    response = preview_client.get("/health", headers={"Origin": origin})
+    assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://pjdsc-drain-git-feature-x-kiloumanjaros-projects.vercel.app",
+        "https://ai-drain-0123abcde-kiloumanjaros-projects.vercel.app",
+        "https://project-drain.vercel.app",
+    ],
+)
+def test_real_preview_and_production_hostnames_may_when_allowed(preview_client, origin):
+    response = preview_client.get("/health", headers={"Origin": origin})
+    assert response.headers.get("access-control-allow-origin") == origin
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://pjdsc-drain.vercel.app",
+        "https://project-drain.vercel.app",
+        "https://ai-drain.vercel.app",
+    ],
+)
+def test_production_hostnames_may_by_default(client, origin):
+    response = client.get("/health", headers={"Origin": origin})
+    assert response.headers.get("access-control-allow-origin") == origin
