@@ -1,0 +1,8 @@
+-r requirements.txt
+
+pytest==9.0.1
+httpx==0.28.1
+ruff==0.15.4
+
+# scripts/sensitivity.py (Kendall's tau); not needed to serve the API.
+scipy==1.18.1
