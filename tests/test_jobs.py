@@ -496,3 +496,43 @@ def test_a_failure_message_keeps_its_meaning_but_not_server_paths():
     assert public_message(posix) == "SWMM failed reading model.rpt at line 4"
     assert public_message(RuntimeError()) == "RuntimeError"
     assert public_message(RuntimeError("did not finish in time")) == "did not finish in time"
+
+
+class TestGroupsAndOutsideCounts:
+    def test_a_group_is_held_to_its_share_across_owners(self):
+        store = JobStore(
+            max_workers=1, max_queued=4, retention=timedelta(minutes=5), max_jobs_per_group=1
+        )
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a", group="10.0.0.1")
+            with pytest.raises(UserLimitError, match="your network"):
+                store.submit(lambda: {}, owner="b", group="10.0.0.1")
+            assert store.submit(lambda: {}, owner="c", group="10.0.0.2").owner == "c"
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_finished_job_frees_its_groups_share(self):
+        store = JobStore(
+            max_workers=1, max_queued=4, retention=timedelta(minutes=5), max_jobs_per_group=1
+        )
+        try:
+            wait_for(store.submit(lambda: {}, owner="a", group="g"), store)
+            assert store.submit(lambda: {}, owner="b", group="g").owner == "b"
+        finally:
+            store.shutdown()
+
+    def test_an_outside_count_of_recent_runs_is_respected(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=4,
+            retention=timedelta(minutes=5),
+            max_runs_per_owner_per_hour=3,
+        )
+        try:
+            with pytest.raises(UserLimitError, match="started 3"):
+                store.submit(lambda: {}, owner="a", prior_runs=3)
+            assert store.submit(lambda: {}, owner="a", prior_runs=2).owner == "a"
+        finally:
+            store.shutdown()

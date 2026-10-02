@@ -15,15 +15,38 @@ DEFAULT_ALLOWED_ORIGINS = (
 )
 
 #: Vercel gives every preview deployment a unique hostname, so they cannot be
-#: enumerated. Match them by pattern. Preview hostnames end in the Vercel team
-#: slug (<project>-<hash>-<team>.vercel.app, or <project>-git-<branch>-<team>),
-#: so anchoring on it keeps other people's "drain-*" projects out.
+#: enumerated. Match them by pattern, as tightly as their two real shapes
+#: allow:
+#:
+#:   <project>-<9-character hash>-<team>.vercel.app   one deployment
+#:   <project>-git-<branch>-<team>.vercel.app         a branch's latest
+#:
+#: The pattern used to accept any "drain-*" text before the team slug, so a
+#: stranger's project named e.g. "drain-x-kiloumanjaros-projects" got the
+#: hostname drain-x-kiloumanjaros-projects.vercel.app and was let in. Now
+#: the part between project and team must be a hash or a git- branch.
+#: Production hostnames are listed exactly, above, never matched.
+#:
+#: Off by default: only production may call the API. A stranger can still
+#: name a project so its hostname has one of these shapes, so previews are
+#: let in only when ALLOWED_ORIGIN_REGEX is set to this (or another) pattern.
 VERCEL_TEAM_SLUG = "kiloumanjaros-projects"
-DEFAULT_ORIGIN_REGEX = (
-    r"https://(pjdsc-drain|project-drain|ai-drain|drain)-[a-z0-9-]+-"
+VERCEL_PROJECTS = ("pjdsc-drain", "project-drain", "ai-drain", "drain")
+VERCEL_PREVIEW_ORIGIN_REGEX = (
+    r"https://(?:"
+    + "|".join(VERCEL_PROJECTS)
+    + r")-(?:[a-z0-9]{9}|git-[a-z0-9]+(?:-[a-z0-9]+)*)-"
     + VERCEL_TEAM_SLUG
     + r"\.vercel\.app"
 )
+#: No pattern: previews are refused.
+DEFAULT_ORIGIN_REGEX = ""
+
+#: The largest request body accepted, in bytes. The biggest real request --
+#: every node and every link in the network, each with all four fields set
+#: to long floats -- is about 495 KB as compact JSON and 600 KB
+#: pretty-printed; this leaves room above that and nothing more.
+DEFAULT_MAX_REQUEST_BYTES = 640 * 1024
 
 
 def _env_list(name: str) -> tuple[str, ...]:
@@ -93,6 +116,41 @@ class Settings:
     #: about two minutes, ten an hour is a third of the server's time.
     max_runs_per_user_per_hour: int = 10
 
+    #: Refuse accounts Supabase has not confirmed an email address for,
+    #: which includes anonymous sign-ins. Accounts are free, so without it
+    #: a handful of throwaway sign-ups could hold every queue slot. Turn
+    #: off only if the app signs people in by phone.
+    require_confirmed_email: bool = True
+
+    #: Runs one client address may have queued or running at once, across
+    #: every account it signs in with. Kept above one for people sharing a
+    #: network (an office, a campus).
+    max_jobs_per_ip: int = 3
+
+    #: Requests per minute one client address may make, per kind. A poll
+    #: every three seconds is 20 a minute, so 120 leaves room for a few
+    #: people behind one address. 0 turns a limit off.
+    submit_rate_per_minute: int = 6
+    poll_rate_per_minute: int = 120
+
+    #: How many proxies in front of the server append to X-Forwarded-For.
+    #: The client's address is read that many entries from the right; 0
+    #: uses the connection's own address. Behind Render's proxy this must
+    #: be 1, or every caller looks like the proxy and shares one limit.
+    trusted_proxy_hops: int = 0
+
+    #: The largest request body accepted, in bytes (413 above it).
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES
+
+    #: Run each simulation in a child process, so one that overruns can be
+    #: killed rather than abandoned still burning CPU. Tests turn it off to
+    #: stub the simulation in-process.
+    isolate_simulations: bool = True
+
+    #: Serve /docs, /redoc and /openapi.json. Off in production: the schema
+    #: is a map for whoever is probing the API.
+    enable_docs: bool = False
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -111,6 +169,14 @@ class Settings:
             require_auth=_env_flag("REQUIRE_AUTH", True),
             max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
             max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),
+            require_confirmed_email=_env_flag("REQUIRE_CONFIRMED_EMAIL", True),
+            max_jobs_per_ip=int(os.getenv("MAX_JOBS_PER_IP", "3")),
+            submit_rate_per_minute=int(os.getenv("SUBMIT_RATE_LIMIT_PER_MINUTE", "6")),
+            poll_rate_per_minute=int(os.getenv("POLL_RATE_LIMIT_PER_MINUTE", "120")),
+            trusted_proxy_hops=int(os.getenv("TRUSTED_PROXY_HOPS", "0")),
+            max_request_bytes=int(os.getenv("MAX_REQUEST_BYTES", str(DEFAULT_MAX_REQUEST_BYTES))),
+            isolate_simulations=_env_flag("ISOLATE_SIMULATIONS", True),
+            enable_docs=_env_flag("ENABLE_DOCS", False),
         )
 
 

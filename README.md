@@ -92,10 +92,18 @@ Urban flood modeling typically requires specialized software and technical exper
 ```
 drAIn-backend/
 ├── app/                   # HTTP layer (FastAPI)
+│   ├── auth.py            # Checks Supabase access tokens
+│   ├── cache.py           # A bounded, expiring cache
 │   ├── config.py          # Settings read from the environment
+│   ├── isolation.py       # Runs a simulation in a child process it can kill
+│   ├── jobs.py            # The run queue
 │   ├── logging_config.py  # Logging setup
 │   ├── main.py            # App factory, CORS, routes
-│   └── schemas.py         # Request/response models
+│   ├── middleware.py      # Body size limit, per-address rate limit, headers
+│   ├── polling.py         # Finished results, serialised once, with ETags
+│   ├── runs.py            # The durable record of runs in Supabase
+│   ├── schemas.py         # Request/response models
+│   └── simulation.py      # A request to its payload; the shared baseline
 ├── drain/                 # Domain logic — no web framework imports
 │   ├── cli.py             # Run a simulation without the server
 │   ├── exposure.py        # Population around a node, by barangay
@@ -120,8 +128,10 @@ drAIn-backend/
 │   └── KMEANS_MODEL.ipynb
 ├── Procfile               # Process configuration
 ├── pyproject.toml         # ruff and pytest configuration
-├── requirements.txt       # Pinned runtime dependencies
-└── requirements-dev.txt   # Adds pytest and ruff
+├── requirements.in        # Direct runtime dependencies
+├── requirements.txt       # ...compiled: every package pinned and hashed
+├── requirements-dev.in    # Adds pytest, ruff and scipy
+└── requirements-dev.txt   # ...compiled the same way
 ```
 
 ---
@@ -153,10 +163,21 @@ python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.txt
 
 # ...or, to also get pytest and ruff
-pip install -r requirements-dev.txt
+pip install --require-hashes -r requirements-dev.txt
+```
+
+Every package, direct or not, is pinned to a version and to the hashes of
+its published files, so an install gets exactly what was tested and a
+tampered download fails. To change a dependency, edit `requirements.in` (or
+`requirements-dev.in`) and recompile both:
+
+```bash
+pip install pip-tools
+pip-compile --generate-hashes --allow-unsafe --strip-extras requirements.in
+pip-compile --generate-hashes --allow-unsafe --strip-extras requirements-dev.in
 ```
 
 ---
@@ -168,7 +189,7 @@ pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
 
 # Server will be available at http://localhost:8000
-# Interactive API docs at http://localhost:8000/docs
+# Interactive API docs at http://localhost:8000/docs, with ENABLE_DOCS=true
 ```
 
 To run a simulation without starting the server:
@@ -192,7 +213,7 @@ All optional; the defaults cover local development and the known deployments.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ALLOWED_ORIGINS` | the production and localhost origins | Comma-separated CORS allowlist |
-| `ALLOWED_ORIGIN_REGEX` | Vercel preview pattern | Matches preview hostnames of the `kiloumanjaros-projects` Vercel team only |
+| `ALLOWED_ORIGIN_REGEX` | empty (previews refused) | Extra origins by pattern. To let Vercel previews call the API, set it to `VERCEL_PREVIEW_ORIGIN_REGEX` from `app/config.py` |
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
@@ -206,6 +227,14 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
 | `SUPABASE_SERVICE_ROLE_KEY` | unset | Records every run in the `simulation_runs` table so results survive a restart. A secret: set it only in the host's environment |
 | `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
+| `REQUIRE_CONFIRMED_EMAIL` | `true` | Refuse accounts without a confirmed email address, anonymous sign-ins included (`403`). Turn off only if the app signs people in by phone |
+| `MAX_JOBS_PER_IP` | `3` | Runs one client address may have queued or running at once, across all its accounts |
+| `SUBMIT_RATE_LIMIT_PER_MINUTE` | `6` | `POST /simulations` requests per minute per client address (`0` turns it off) |
+| `POLL_RATE_LIMIT_PER_MINUTE` | `120` | `GET /simulations/...` requests per minute per client address (`0` turns it off) |
+| `TRUSTED_PROXY_HOPS` | `0` | How many proxies in front of the server append to `X-Forwarded-For`. **Set to `1` on Render** (see Deployment) |
+| `MAX_REQUEST_BYTES` | `655360` | Largest request body accepted (`413` above it). The biggest real request, every node and link with every field, is about 495 KB |
+| `ISOLATE_SIMULATIONS` | `true` | Run each simulation in a child process that is killed at `MAX_RUNTIME_SECONDS` |
+| `ENABLE_DOCS` | `false` | Serve `/docs`, `/redoc` and `/openapi.json` |
 
 Without `SUPABASE_URL` and `SUPABASE_ANON_KEY` the server refuses every
 simulation with `503` rather than opening them to everyone. To try the API
@@ -268,18 +297,42 @@ proxies keep a request open — so simulations are **queued and polled**.
 
 **Sign-in.** Both simulation endpoints need the caller's Supabase access
 token: `Authorization: Bearer <access_token>`, the same token the app's
-browser session holds. The server checks it with Supabase Auth (cached for
-a minute). Missing or expired: `401`. A job can only be read back by the
-person who started it; anyone else gets `404`. CORS is not access control
-— it is a browser courtesy that `curl` ignores — so this is what keeps the
-run queue for the app's users.
+browser session holds. Missing, malformed or expired: `401`. A job can only
+be read back by the person who started it; anyone else gets `404`. CORS is
+not access control — it is a browser courtesy that `curl` ignores — so this
+is what keeps the run queue for the app's users.
+
+The server first checks what it can without a network call: the token is a
+JWT for this project (`iss`), for a signed-in user (`aud` and `role` both
+`authenticated`), not expired, with an allowed algorithm. A token signed
+with one of the project's asymmetric keys (ES256/RS256) then has its
+signature checked against the keys Supabase publishes, so a forged token
+never reaches Supabase. Every token still standing, including legacy
+shared-secret (HS256) ones, is then confirmed with Supabase Auth, which
+knows whether the session is still live. Answers are cached
+for a minute (refusals for 30 seconds). With `REQUIRE_CONFIRMED_EMAIL` on,
+an account without a confirmed email gets `403`.
+
+> **Signing out is not instant.** A token is accepted for up to a minute
+> after its session is revoked, while its cached answer lasts.
+
+**Limits.** Each client address may start 6 runs a minute and poll 120
+times a minute (`429` past either), and hold 3 queued or running runs
+across all its accounts. Each account may hold one, and start 10 an hour;
+with `SUPABASE_SERVICE_ROLE_KEY` set, the hour is counted from the
+`simulation_runs` table, so a restart doesn't reset it. Request bodies over
+640 KB get `413`.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
   and where to poll. Returns `429` when the caller already has a run going,
-  has used their hourly allowance, or the server is full, and `503` while the
-  server is shutting down.
+  has used their hourly allowance, their address is sending too much or
+  already has too many runs waiting, or the server is full; `403` for an
+  account without a confirmed email; `413` for a body over the limit; and
+  `503` while the server is shutting down.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
-  succeeds. Returns `404` once the result has expired.
+  succeeds. Returns `404` once the result has expired. A finished result
+  carries an `ETag`; send it back as `If-None-Match` and the answer is a
+  bodiless `304`. (Browsers do this on their own.)
 - `GET /health` — liveness probe: `{"status": "ok"}`.
 
 `POST /simulations` accepts three optional sections:
@@ -293,8 +346,12 @@ run queue for the app's users.
 ```
 
 A request with none of them returns the pre-computed results for the
-unmodified network, so it finishes almost immediately. Anything else runs a
-real simulation.
+unmodified network, so it finishes almost immediately. Every such run
+shares one copy of that result in memory, and its row in `simulation_runs`
+stores `{"unmodified_network": true}` in place of the 0.7 MB result, which
+the server fills back in when the run is read. Anything else runs a real
+simulation, in a child process that is killed if it passes
+`MAX_RUNTIME_SECONDS`.
 
 Invalid input is rejected with `422` before anything is queued: every
 value must be a finite number in a physically possible range (see
@@ -362,6 +419,18 @@ The backend is deployed on Render and serves the production API:
 3. Render auto-deploys on every push to `main`
 
 `Procfile` starts `app.main:app` and binds `$PORT`.
+
+In production, also set:
+
+- `TRUSTED_PROXY_HOPS=1`. Render's proxy connects to the app, so without it
+  every caller has the proxy's address and they all share one rate limit.
+  The server reads the address the proxy appended to `X-Forwarded-For`, not
+  the leftmost entry, which the caller writes. (Uvicorn's
+  `--forwarded-allow-ips='*'` takes the leftmost, so it is not used.) If
+  another proxy, such as a CDN, sits in front of Render, count it too. The
+  server logs a warning if it sees `X-Forwarded-For` while this is `0`.
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`.
+- Leave `ENABLE_DOCS` unset.
 
 ---
 

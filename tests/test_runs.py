@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app.jobs import JobStatus, JobStore, SimulationJob
 from app.main import RESTARTED_MESSAGE, create_app
 from app.runs import RunRecorder, RunStoreError, SupabaseRunRepository
+from app.simulation import BASELINE_MARKER, baseline_result
 from drain.model_info import network_sha256
 from tests.test_api import AS_A, AS_B, TEST_SETTINGS, FakeAuthenticator
 
@@ -30,9 +31,11 @@ class FakePostgrest:
         self.status = status
         self.body = body
         self.calls = []
+        self.timeouts = []
 
-    def __call__(self, method, url, headers, body):
+    def __call__(self, method, url, headers, body, timeout):
         self.calls.append((method, url, headers, json.loads(body) if body else None))
+        self.timeouts.append(timeout)
         return self.status, self.body
 
 
@@ -145,6 +148,10 @@ class MemoryRepository:
 
     def prune(self, older_than):
         self.pruned.append(older_than)
+
+    def count_recent(self, owner, since, limit):
+        recent = [job for job in self.rows.values() if job.owner == owner]
+        return min(limit, len([job for job in recent if job.created_at >= since]))
 
 
 class TestRunRecorder:
@@ -321,3 +328,130 @@ class TestRunsSurviveRestarts:
                 assert memory.rows[job_id].owner == USER_A
         finally:
             release.set()
+
+
+class TestTheBaselineIsStoredOnce:
+    """Every run of the unmodified network has the same 0.7 MB result, and
+    each used to be written to the table in full."""
+
+    def test_a_baseline_run_stores_the_marker(self):
+        fake = FakePostgrest()
+        repository(fake).save(finished_job(result=baseline_result()))
+        assert fake.calls[0][3]["result"] == BASELINE_MARKER
+
+    def test_an_equal_but_separate_result_is_stored_in_full(self):
+        fake = FakePostgrest()
+        copy = json.loads(json.dumps(baseline_result()))
+        repository(fake).save(finished_job(result=copy))
+        assert fake.calls[0][3]["result"] != BASELINE_MARKER
+
+    def test_the_marker_is_read_back_as_the_baseline(self):
+        row = {
+            "id": JOB_ID,
+            "user_id": USER_A,
+            "status": "succeeded",
+            "created_at": "2026-09-01T00:00:00+00:00",
+            "started_at": "2026-09-01T00:01:00+00:00",
+            "finished_at": "2026-09-01T00:03:00+00:00",
+            "result": BASELINE_MARKER,
+            "error": None,
+        }
+        job = repository(FakePostgrest(200, json.dumps([row]).encode())).load(JOB_ID)
+        assert job.result is baseline_result()
+
+
+class TestRecentRunCount:
+    def test_it_counts_the_owners_runs_in_the_window(self):
+        fake = FakePostgrest(200, json.dumps([{"id": "a"}, {"id": "b"}]).encode())
+        since = datetime(2026, 9, 1, tzinfo=UTC)
+        assert repository(fake).count_recent(USER_A, since, limit=10) == 2
+
+        method, url, _, _ = fake.calls[0]
+        assert method == "GET"
+        assert f"user_id=eq.{USER_A}" in url
+        assert "created_at=gte.2026-09-01" in url
+        assert "limit=10" in url
+        # A request waits on this, so it may not take the writes' 30 s.
+        assert fake.timeouts[0] <= 5
+
+    def test_a_non_account_owner_is_never_looked_up(self):
+        fake = FakePostgrest(200, b"[]")
+        assert repository(fake).count_recent("local-dev", datetime.now(UTC), 10) == 0
+        assert fake.calls == []
+
+
+class TestLimitsSurviveRestarts:
+    """Regression: the hourly allowance was counted in memory only, so every
+    restart handed everyone a fresh one."""
+
+    def make_app(self, memory, **overrides):
+        return create_app(
+            replace(TEST_SETTINGS, **overrides),
+            authenticator=FakeAuthByUuid(),
+            runs=memory,
+        )
+
+    def test_runs_recorded_before_a_restart_count_against_the_hour(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        memory = MemoryRepository()
+        for n in range(2):
+            job_id = f"11111111-1111-4111-8111-00000000000{n}"
+            memory.rows[job_id] = finished_job(id=job_id, created_at=datetime.now(UTC))
+        with TestClient(self.make_app(memory, max_runs_per_user_per_hour=2)) as client:
+            refused = client.post("/simulations", json={}, headers=AS_A)
+            assert refused.status_code == 429
+            assert "past hour" in refused.json()["detail"]
+            assert client.post("/simulations", json={}, headers=AS_B).status_code == 202
+
+    def test_runs_older_than_an_hour_do_not(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        memory = MemoryRepository()
+        memory.rows[JOB_ID] = finished_job(created_at=datetime.now(UTC) - timedelta(hours=2))
+        with TestClient(self.make_app(memory, max_runs_per_user_per_hour=1)) as client:
+            assert client.post("/simulations", json={}, headers=AS_A).status_code == 202
+
+    def test_if_the_table_cannot_be_counted_memory_decides(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+
+        class Uncountable(MemoryRepository):
+            def count_recent(self, owner, since, limit):
+                raise RunStoreError("down")
+
+        with TestClient(self.make_app(Uncountable())) as client:
+            assert client.post("/simulations", json={}, headers=AS_A).status_code == 202
+
+
+class TestUnknownRunsAreRemembered:
+    def test_polling_an_unknown_run_asks_the_table_once(self):
+        class Counting(MemoryRepository):
+            def __init__(self):
+                super().__init__()
+                self.loads = 0
+
+            def load(self, job_id):
+                self.loads += 1
+                return super().load(job_id)
+
+        memory = Counting()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            for _ in range(3):
+                assert client.get(f"/simulations/{JOB_ID}").status_code == 404
+        assert memory.loads == 1
+
+    def test_a_stored_result_is_served_from_cache_after_the_first_read(self):
+        class Counting(MemoryRepository):
+            loads = 0
+
+            def load(self, job_id):
+                Counting.loads += 1
+                return super().load(job_id)
+
+        memory = Counting()
+        memory.rows[JOB_ID] = finished_job()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            for _ in range(3):
+                assert client.get(f"/simulations/{JOB_ID}").status_code == 200
+            assert client.get(f"/simulations/{JOB_ID}", headers=AS_B).status_code == 404
+        assert Counting.loads == 1

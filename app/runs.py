@@ -2,7 +2,7 @@
 
 The job store (:mod:`app.jobs`) holds runs in this process's memory, which
 is gone after a restart -- frequent on a free-tier host -- and after the
-retention window. Each run is also written to the \`\`simulation_runs\`\` table
+retention window. Each run is also written to the ``simulation_runs`` table
 as it moves along, and read back from there when memory no longer has it.
 So a result the app was told it could collect is still there to collect.
 
@@ -12,7 +12,7 @@ holds up a request or a simulation. A failed write is logged and dropped:
 the run itself matters more than its record.
 
 The table is defined in the frontend repository's
-\`\`supabase/schemas/schema_ops.sql\`\`.
+``supabase/schemas/schema_ops.sql``.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from app.jobs import JobStatus, SimulationJob
+from app.simulation import BASELINE_MARKER, baseline_result, is_baseline
 from drain.model_info import network_sha256
 
 logger = logging.getLogger(__name__)
@@ -47,25 +48,35 @@ class RunRepository(Protocol):
         """Insert or update a run's row."""
 
     def load(self, job_id: str) -> SimulationJob | None:
-        """A stored run, or \`\`None\`\` if there is none."""
+        """A stored run, or ``None`` if there is none."""
 
     def fail_unfinished(self, reason: str) -> None:
         """Mark every queued or running run failed (after a restart)."""
 
     def prune(self, older_than: datetime) -> None:
-        """Delete runs created before \`\`older_than\`\`."""
+        """Delete runs created before ``older_than``."""
+
+    def count_recent(self, owner: str, since: datetime, limit: int) -> int:
+        """How many runs ``owner`` created since ``since``, counting to ``limit``."""
 
 
-#: Takes (method, url, headers, body) and returns (HTTP status, body).
-Fetch = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
+#: Takes (method, url, headers, body, timeout) and returns (HTTP status, body).
+Fetch = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, bytes]]
+
+#: Seconds a write or clean-up may take. They run off the request path.
+WRITE_TIMEOUT_SECONDS = 30.0
+
+#: Seconds the count behind a new run may take. A request waits on it, so
+#: past this the server counts from memory instead.
+COUNT_TIMEOUT_SECONDS = 3.0
 
 
 def _urllib_fetch(
-    method: str, url: str, headers: dict[str, str], body: bytes | None
+    method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: float
 ) -> tuple[int, bytes]:
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
@@ -88,17 +99,28 @@ def _iso(moment: datetime | None) -> str | None:
 
 
 def _compact(result: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The result without ``nodes_dict``, which repeats ``nodes_list``. The API
-    no longer sends it (app.main.served); this still keeps it out of the
-    table if a result ever carries it."""
+    """The result as stored.
+
+    Without ``nodes_dict``, which repeats ``nodes_list``: the API no longer
+    sends it (app.simulation.served); this still keeps it out of the table
+    if a result ever carries it. And a run of the unmodified network stores
+    :data:`BASELINE_MARKER` rather than its own copy of the same 0.7 MB.
+    """
     if result is None:
         return None
+    if is_baseline(result):
+        return BASELINE_MARKER
     return {key: value for key, value in result.items() if key != "nodes_dict"}
+
+
+def _restored(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A stored result as the API sends it: the marker becomes the baseline."""
+    return baseline_result() if result == BASELINE_MARKER else result
 
 
 @dataclass
 class SupabaseRunRepository:
-    """Reads and writes \`\`simulation_runs\`\` through Supabase's REST API."""
+    """Reads and writes ``simulation_runs`` through Supabase's REST API."""
 
     supabase_url: str
     service_role_key: str
@@ -110,6 +132,7 @@ class SupabaseRunRepository:
         query: str = "",
         body: Any = None,
         prefer: str | None = None,
+        timeout: float = WRITE_TIMEOUT_SECONDS,
     ) -> bytes:
         headers = {
             "apikey": self.service_role_key,
@@ -120,7 +143,7 @@ class SupabaseRunRepository:
             headers["Prefer"] = prefer
         url = f"{self.supabase_url.rstrip('/')}{TABLE_PATH}{query}"
         payload = json.dumps(body).encode() if body is not None else None
-        status, response = self.fetch(method, url, headers, payload)
+        status, response = self.fetch(method, url, headers, payload, timeout)
         if not 200 <= status < 300:
             raise RunStoreError(
                 f"{method} simulation_runs answered HTTP {status}: {response[:200]!r}"
@@ -169,7 +192,7 @@ class SupabaseRunRepository:
             finished_at=(
                 datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
             ),
-            result=row["result"],
+            result=_restored(row["result"]),
             error=row["error"],
         )
 
@@ -185,6 +208,20 @@ class SupabaseRunRepository:
         query = "?" + urllib.parse.urlencode({"created_at": f"lt.{older_than.isoformat()}"})
         self._call("DELETE", query, prefer="return=minimal")
 
+    def count_recent(self, owner: str, since: datetime, limit: int) -> int:
+        if not is_uuid(owner):
+            return 0
+        query = "?" + urllib.parse.urlencode(
+            {
+                "select": "id",
+                "user_id": f"eq.{owner}",
+                "created_at": f"gte.{since.isoformat()}",
+                "limit": str(limit),
+            }
+        )
+        rows = json.loads(self._call("GET", query, timeout=COUNT_TIMEOUT_SECONDS) or b"[]")
+        return len(rows)
+
 
 _STOP = object()
 
@@ -197,7 +234,7 @@ MAX_PENDING_WRITES = 256
 class RunRecorder:
     """Writes run changes to a repository on one background thread, in order.
 
-    The job store calls :meth:\`record\` with a snapshot each time a run is
+    The job store calls :meth:`record` with a snapshot each time a run is
     queued, starts or finishes, sometimes while holding its lock, so this
     only puts the snapshot on a queue.
     """
