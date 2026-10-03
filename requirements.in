@@ -1,0 +1,17 @@
+# Direct runtime dependencies. requirements.txt is compiled from this file,
+# with every transitive dependency pinned and hashed:
+#
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras requirements.in
+
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+
+# Checks Supabase access tokens signed with the project's published keys.
+PyJWT[crypto]==2.15.1
+
+# Numerics
+numpy==2.5.3
+
+# SWMM engine
+pyswmm==2.1.0

@@ -1,0 +1,14 @@
+# Development dependencies. requirements-dev.txt is compiled from this file,
+# pinned and hashed, with the runtime pins held to requirements.txt:
+#
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras requirements-dev.in
+
+-c requirements.txt
+-r requirements.in
+
+pytest==9.0.1
+httpx==0.28.1
+ruff==0.15.4
+
+# scripts/sensitivity.py (Kendall's tau); not needed to serve the API.
+scipy==1.18.1
