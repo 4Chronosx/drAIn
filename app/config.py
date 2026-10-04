@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 #: Origins always permitted, covering local development and the named
 #: production deployments.
@@ -54,11 +54,27 @@ def _env_list(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
+
+
 def _env_flag(name: str, default: bool) -> bool:
+    """A switch from the environment; unset or empty means ``default``.
+
+    Anything that is not a known spelling is an error. It used to count as
+    on, so ``ENABLE_DOCS=flase`` served the docs.
+    """
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, yes/no, on/off or 1/0, not {raw.strip()!r}."
+    )
 
 
 @dataclass(frozen=True)
@@ -99,8 +115,9 @@ class Settings:
     supabase_anon_key: str | None = None
     #: The project's service-role key. With it, every run is also recorded in
     #: the simulation_runs table, so results survive a restart. A secret:
-    #: set it only in the host's environment.
-    supabase_service_role_key: str | None = None
+    #: set it only in the host's environment, and kept out of the repr so a
+    #: logged or printed Settings doesn't carry it.
+    supabase_service_role_key: str | None = field(default=None, repr=False)
 
     #: How long recorded runs are kept in Supabase.
     run_retention_days: int = 7

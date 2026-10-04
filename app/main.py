@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -68,6 +69,11 @@ MAX_IDS_LISTED = 10
 
 #: What a run caught mid-way by a restart says when it is read back.
 RESTARTED_MESSAGE = "The simulation server restarted before this run finished. Please run it again."
+
+#: A job id as the job store writes one: a hyphenated UUID. Anything else in
+#: the path is not a job, and is turned away before it is looked up or
+#: remembered anywhere.
+_JOB_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
 
 def _build_run_repository(config: Settings) -> RunRepository | None:
@@ -265,8 +271,9 @@ def current_caller(request: Request) -> Caller:
         )
     try:
         caller = auth.authenticate(token.strip())
-    except AuthUnavailableError:
-        logger.exception("Could not check a caller's sign-in")
+    except AuthUnavailableError as error:
+        # One line, no traceback: during an outage every request lands here.
+        logger.warning("Could not check a caller's sign-in: %s", error)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not check your sign-in. Try again shortly.",
@@ -368,8 +375,12 @@ def create_app(
     app.add_middleware(SecurityHeadersMiddleware)
 
     @app.get("/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
-        """Liveness probe."""
+    async def health() -> HealthResponse:
+        """Liveness probe.
+
+        Async, so it is answered on the event loop rather than waiting for a
+        thread behind requests that are blocked on Supabase.
+        """
         return HealthResponse(status="ok")
 
     @app.post(
@@ -431,6 +442,9 @@ def create_app(
         A finished job's response carries an ETag; sending it back in
         ``If-None-Match`` gets a bodiless 304 instead of the result again.
         """
+        if _JOB_ID.fullmatch(job_id) is None:
+            raise _not_found()
+        job_id = job_id.lower()
         finished = rendered.get(job_id)
         if finished is None:
             job = jobs.get(job_id)

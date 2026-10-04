@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -65,6 +65,9 @@ Fetch = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, byt
 
 #: Seconds a write or clean-up may take. They run off the request path.
 WRITE_TIMEOUT_SECONDS = 30.0
+
+#: Seconds reading a run back may take. A poll waits on it.
+LOAD_TIMEOUT_SECONDS = 5.0
 
 #: Seconds the count behind a new run may take. A request waits on it, so
 #: past this the server counts from memory instead.
@@ -123,7 +126,8 @@ class SupabaseRunRepository:
     """Reads and writes ``simulation_runs`` through Supabase's REST API."""
 
     supabase_url: str
-    service_role_key: str
+    #: Out of the repr, which ends up in logs and tracebacks.
+    service_role_key: str = field(repr=False)
     fetch: Fetch = _urllib_fetch
 
     def _call(
@@ -179,7 +183,7 @@ class SupabaseRunRepository:
         if not is_uuid(job_id):
             return None
         query = "?" + urllib.parse.urlencode({"id": f"eq.{job_id}", "select": "*"})
-        rows = json.loads(self._call("GET", query) or b"[]")
+        rows = json.loads(self._call("GET", query, timeout=LOAD_TIMEOUT_SECONDS) or b"[]")
         if not rows:
             return None
         row = rows[0]

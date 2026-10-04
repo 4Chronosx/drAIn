@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import threading
 import time
 from dataclasses import replace
@@ -109,6 +111,12 @@ def test_health_needs_no_sign_in():
         assert anonymous.get("/health").status_code == 200
 
 
+def test_health_does_not_wait_for_a_worker_thread(client):
+    # A plain function would queue behind requests blocked on Supabase.
+    route = next(route for route in client.app.routes if route.path == "/health")
+    assert inspect.iscoroutinefunction(route.endpoint)
+
+
 def test_unmodified_request_serves_the_baseline(client):
     """An empty request needs no simulation, so this stays fast."""
     body = baseline(client)
@@ -206,6 +214,21 @@ class TestSignIn:
         with TestClient(make_app(BrokenAuthenticator())) as outage:
             response = outage.post("/simulations", json={}, headers=AS_A)
         assert response.status_code == 503
+
+    def test_an_auth_outage_is_logged_as_one_line(self, caplog):
+        # Every request during an outage lands here; a traceback for each
+        # buried everything else in the log.
+        with TestClient(make_app(BrokenAuthenticator())) as outage:
+            # Start-up reconfigures logging, so listen only once it has.
+            logging.getLogger("app.main").addHandler(caplog.handler)
+            try:
+                outage.post("/simulations", json={}, headers=AS_A)
+            finally:
+                logging.getLogger("app.main").removeHandler(caplog.handler)
+        records = [record for record in caplog.records if "sign-in" in record.getMessage()]
+        assert [record.levelno for record in records] == [logging.WARNING]
+        assert "Supabase is down" in records[0].getMessage()
+        assert records[0].exc_info is None
 
     def test_local_development_can_turn_sign_in_off(self):
         app = create_app(replace(TEST_SETTINGS, require_auth=False))

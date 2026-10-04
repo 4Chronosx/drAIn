@@ -124,6 +124,17 @@ class TestSupabaseRunRepository:
         with pytest.raises(RunStoreError):
             repository(FakePostgrest(500, b"boom")).save(finished_job())
 
+    def test_reading_a_run_back_does_not_wait_as_long_as_a_write(self):
+        # A poll waits on the read; the writes' 30 s would hold its thread.
+        fake = FakePostgrest(200, b"[]")
+        repository(fake).load(JOB_ID)
+        assert fake.timeouts == [5.0]
+
+    def test_the_service_role_key_is_not_in_the_repr(self):
+        shown = repr(repository(FakePostgrest()))
+        assert "service-key" not in shown
+        assert "p.supabase.co" in shown
+
 
 class MemoryRepository:
     """Keeps rows in a dict, the way the table would."""
@@ -455,3 +466,68 @@ class TestUnknownRunsAreRemembered:
                 assert client.get(f"/simulations/{JOB_ID}").status_code == 200
             assert client.get(f"/simulations/{JOB_ID}", headers=AS_B).status_code == 404
         assert Counting.loads == 1
+
+    def test_someone_elses_stored_result_is_not_rendered_for_them(self, monkeypatch):
+        rendered = []
+        monkeypatch.setattr("app.main.render", lambda job: rendered.append(job))
+        memory = MemoryRepository()
+        memory.rows[JOB_ID] = finished_job()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_B) as client:
+            assert client.get(f"/simulations/{JOB_ID}").status_code == 404
+        assert rendered == []
+
+
+class TestJobIdsAreChecked:
+    """The id in a poll's path is the caller's to write. Only the form the
+    job store issues is looked up; ``uuid.UUID`` also takes braces, a urn
+    prefix and bare hex, and each spelling was a separate cache entry and a
+    separate question to Supabase."""
+
+    LETTERED_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    class Counting(MemoryRepository):
+        def __init__(self):
+            super().__init__()
+            self.loads = []
+
+        def load(self, job_id):
+            self.loads.append(job_id)
+            return super().load(job_id)
+
+    @pytest.mark.parametrize(
+        "job_id",
+        [
+            "nope",
+            JOB_ID.replace("-", ""),
+            "{" + JOB_ID + "}",
+            "urn:uuid:" + JOB_ID,
+            JOB_ID + "0",
+            JOB_ID[:-1] + "g",
+        ],
+    )
+    def test_a_malformed_id_is_not_found_without_being_looked_up(self, monkeypatch, job_id):
+        remembered = []
+        monkeypatch.setattr(
+            "app.polling.RenderedStates.mark_unknown",
+            lambda self, unknown: remembered.append(unknown),
+        )
+        memory = self.Counting()
+        memory.rows[JOB_ID] = finished_job()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            response = client.get(f"/simulations/{job_id}")
+        assert response.status_code == 404
+        assert "expired" in response.json()["detail"]
+        assert memory.loads == [] and remembered == []
+
+    def test_an_id_in_capitals_is_the_same_run(self):
+        memory = self.Counting()
+        memory.rows[self.LETTERED_ID] = finished_job(id=self.LETTERED_ID)
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            for job_id in (self.LETTERED_ID.upper(), self.LETTERED_ID):
+                response = client.get(f"/simulations/{job_id}")
+                assert response.status_code == 200
+                assert response.json()["job_id"] == self.LETTERED_ID
+        assert memory.loads == [self.LETTERED_ID]
