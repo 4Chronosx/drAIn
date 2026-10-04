@@ -202,8 +202,10 @@ class MemoryRepository:
 
     def trim_owner(self, owner, keep):
         self.trimmed.append((owner, keep))
+        # Two runs can share a created_at on a coarse clock (Windows ticks every
+        # ~15 ms); the later-saved one then counts as newer.
         mine = sorted(
-            (job for job in self.rows.values() if job.owner == owner),
+            reversed([job for job in self.rows.values() if job.owner == owner]),
             key=lambda job: job.created_at,
             reverse=True,
         )
