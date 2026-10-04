@@ -307,9 +307,11 @@ JWT for this project (`iss`), for a signed-in user (`aud` and `role` both
 `authenticated`), not expired, with an allowed algorithm. A token signed
 with one of the project's asymmetric keys (ES256/RS256) then has its
 signature checked against the keys Supabase publishes, so a forged token
-never reaches Supabase. Every token still standing, including legacy
-shared-secret (HS256) ones, is then confirmed with Supabase Auth, which
-knows whether the session is still live. Answers are cached
+never reaches Supabase. Once the project publishes such keys, a token
+claiming the legacy shared secret (HS256) is refused the same way; while
+it publishes none, HS256 tokens go on to Supabase. Every token still
+standing is then confirmed with Supabase Auth, which knows whether the
+session is still live. Answers are cached
 for a minute (refusals for 30 seconds). With `REQUIRE_CONFIRMED_EMAIL` on,
 an account without a confirmed email gets `403`.
 

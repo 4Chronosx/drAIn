@@ -14,16 +14,19 @@ A token goes through up to three checks, cheapest first:
    stream of made-up tokens tied up the server doing Supabase's work.
 2. **Its signature, locally,** for tokens signed with an asymmetric key
    (ES256, RS256), against the project's published keys (JWKS). A forged
-   token is refused here, without a network call.
+   token is refused here, without a network call. So is every HS256 token
+   once the project is known to publish keys: it signs with those, and a
+   token claiming the shared secret is one somebody wrote.
 3. **Supabase Auth** (``GET /auth/v1/user``) for every token still
    standing: a genuine signature says who signed in, but only Supabase
    knows whether that session has since been signed out. Tokens signed
-   with the project's shared secret (HS256), or any token while the
-   published keys can't be fetched, rely on this check alone.
+   with the shared secret (HS256) by a project that publishes no keys, or
+   any token while the published keys can't be fetched, rely on this check
+   alone.
 
 Answers are kept briefly -- a client polls every few seconds while it waits
-for a run -- in a bounded cache: a minute for an accepted token, 30 seconds
-for a refused one.
+for a run -- in two bounded caches, so that refused tokens can't crowd out
+accepted ones: a minute for an accepted token, 30 seconds for a refused one.
 
 **Signing out is not instant.** A token stays accepted for up to a minute
 after its session is revoked: the cached answer outlives the session by at
@@ -196,32 +199,55 @@ class _PublishedKeys:
 
     def find(self, kid: str) -> tuple[bool, jwt.PyJWK | None]:
         """(whether the keys are known, the key with this id if they have it)."""
+        keys = self._current(kid)
+        if keys is None:
+            return False, None
+        return True, keys.get(kid)
+
+    def published(self) -> bool:
+        """Whether the project is known to publish asymmetric keys."""
+        return self._current() is not None
+
+    def _current(self, kid: str | None = None) -> dict[str, jwt.PyJWK] | None:
+        """The keys held, refetched first if they are due.
+
+        The fetch is a network call of up to five seconds, so it is made
+        without the lock: whoever finds the keys due stamps the attempt and
+        fetches, and everyone arriving meanwhile uses the keys already held
+        instead of queueing behind it.
+        """
         with self._lock:
             now = self._clock()
             stale = now - self._fetched_at > JWKS_REFRESH_SECONDS
-            missing = self._keys is not None and kid not in self._keys
-            if (stale or missing) and now - self._attempted_at > JWKS_RETRY_SECONDS:
-                self._attempted_at = now
-                self._refresh(now)
-            if self._keys is None:
-                return False, None
-            return True, self._keys.get(kid)
+            missing = kid is not None and self._keys is not None and kid not in self._keys
+            due = (stale or missing) and now - self._attempted_at > JWKS_RETRY_SECONDS
+            if not due:
+                return self._keys
+            self._attempted_at = now
 
-    def _refresh(self, now: float) -> None:
-        """Caller holds the lock. On failure the keys already held are kept."""
+        fetched, keys = self._fetch_keys()
+        with self._lock:
+            if fetched:
+                self._keys = keys
+                self._fetched_at = now
+            return self._keys
+
+    def _fetch_keys(self) -> tuple[bool, dict[str, jwt.PyJWK] | None]:
+        """(whether the fetch worked, the keys it listed). A failure leaves
+        the keys already held in place."""
         try:
             status, body = self._fetch(self._url, {"apikey": self._api_key})
         except AuthUnavailableError:
             logger.warning("Could not fetch the project's signing keys")
-            return
+            return False, None
         if status != 200:
             logger.warning("Fetching the project's signing keys answered HTTP %d", status)
-            return
+            return False, None
         try:
             listed = json.loads(body).get("keys", [])
         except (ValueError, AttributeError):
             logger.warning("The project's signing keys were unreadable")
-            return
+            return False, None
         keys: dict[str, jwt.PyJWK] = {}
         for entry in listed if isinstance(listed, list) else []:
             try:
@@ -232,8 +258,7 @@ class _PublishedKeys:
                 keys[key.key_id] = key
         # A project still on the shared secret publishes none; its tokens
         # go to Supabase.
-        self._keys = keys or None
-        self._fetched_at = now
+        return True, keys or None
 
 
 class SupabaseAuthenticator:
@@ -268,20 +293,31 @@ class SupabaseAuthenticator:
         # used to be rebuilt in full on every miss, which made a stream of
         # unseen tokens quadratic.
         self._tokens = ExpiringLru(max_cached)
+        # Refused tokens are remembered apart from accepted ones. Made-up
+        # tokens cost nothing to produce, and in one cache a flood of them
+        # pushed out the people actually signed in.
+        self._refused = ExpiringLru(max_cached)
         self._checks = threading.BoundedSemaphore(MAX_CONCURRENT_CHECKS)
 
     def authenticate(self, token: str) -> Caller | None:
         key = hashlib.sha256(token.encode()).hexdigest()
         now = self._clock()
-        cached = self._tokens.get(key, now)
-        if cached is not MISSING:
-            return self._answer(cached)
+        for cache in (self._tokens, self._refused):
+            cached = cache.get(key, now)
+            if cached is not MISSING:
+                return self._answer(cached)
 
         parsed = read_unverified(token, self._issuer, self._wall_clock())
         if parsed is None:
             return self._answer(self._remember(key, None, now))
         header, claims = parsed
         lifetime = float(claims["exp"]) - self._wall_clock()
+
+        if header["alg"] not in ASYMMETRIC_ALGORITHMS and self._keys.published():
+            # The project signs with an asymmetric key, so it issued no
+            # HS256 token. Anyone can write one, and each used to be sent
+            # to Supabase to be turned down.
+            return self._answer(self._remember(key, None, now))
 
         if header["alg"] in ASYMMETRIC_ALGORITHMS:
             verdict = self._check_signature(token, header)
@@ -297,8 +333,8 @@ class SupabaseAuthenticator:
                     )
                 return self._answer(self._remember(key, outcome, now, lifetime))
 
-        # HS256, or the published keys could not be fetched: only Supabase
-        # can say.
+        # HS256 from a project that publishes no keys, or the published keys
+        # could not be fetched: only Supabase can say.
         return self._answer(self._remember(key, self._ask_supabase(token), now, lifetime))
 
     @staticmethod
@@ -309,11 +345,12 @@ class SupabaseAuthenticator:
 
     def _remember(self, key: str, outcome: Any, now: float, lifetime: float | None = None) -> Any:
         """Cache an outcome for as long as it may be trusted, and return it."""
-        seconds = self._cache_seconds if isinstance(outcome, Caller) else self._rejection_seconds
+        accepted = isinstance(outcome, Caller)
+        seconds = self._cache_seconds if accepted else self._rejection_seconds
         if lifetime is not None:
             # Never past the token's own expiry.
             seconds = max(0.0, min(seconds, lifetime))
-        self._tokens.put(key, outcome, now + seconds)
+        (self._tokens if accepted else self._refused).put(key, outcome, now + seconds)
         return outcome
 
     def _check_signature(self, token: str, header: dict[str, Any]) -> str:
