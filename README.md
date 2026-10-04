@@ -217,6 +217,7 @@ All optional; the defaults cover local development and the known deployments.
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
+| `QUEUE_SLOTS_RESERVED` | `2` | The last places in the queue are kept for people who have started at most two runs in the past hour (`0` keeps none back) |
 | `RESULT_RETENTION_SECONDS` | `900` | How long a finished result stays pollable |
 | `MAX_RUNTIME_SECONDS` | `1800` | A run still going after this is failed, its queue slot freed, and the jobs behind it moved to a fresh worker |
 | `MAX_QUEUE_WAIT_SECONDS` | `3600` | A job still waiting to start after this is failed |
@@ -227,6 +228,7 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
 | `SUPABASE_SERVICE_ROLE_KEY` | unset | Records every run in the `simulation_runs` table so results survive a restart. A secret: set it only in the host's environment |
 | `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
+| `MAX_STORED_RUNS_PER_USER` | `20` | Recorded runs kept per person; a new run deletes their oldest finished ones beyond it (`0` keeps them all until they age out) |
 | `REQUIRE_CONFIRMED_EMAIL` | `true` | Refuse accounts without a confirmed email address, anonymous sign-ins included (`403`). Turn off only if the app signs people in by phone |
 | `MAX_JOBS_PER_IP` | `3` | Runs one client address may have queued or running at once, across all its accounts |
 | `SUBMIT_RATE_LIMIT_PER_MINUTE` | `6` | `POST /simulations` requests per minute per client address (`0` turns it off) |
@@ -322,8 +324,11 @@ an account without a confirmed email gets `403`.
 times a minute (`429` past either), and hold 3 queued or running runs
 across all its accounts. Each account may hold one, and start 10 an hour;
 with `SUPABASE_SERVICE_ROLE_KEY` set, the hour is counted from the
-`simulation_runs` table, so a restart doesn't reset it. Request bodies over
-640 KB get `413`.
+`simulation_runs` table, so a restart doesn't reset it. An IPv6 caller is
+counted as their /64 network, since they can send from any address in it.
+The last 2 of the queue's 8 places are kept for accounts that have started
+at most two runs in the past hour, so a few heavy users can't fill it
+against everyone else. Request bodies over 640 KB get `413`.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
   and where to poll. Returns `429` when the caller already has a run going,
@@ -381,7 +386,9 @@ starts and finishes (the table is defined in the frontend repository's
 `supabase/schemas/schema_ops.sql`). A poll for a run the server no longer
 holds in memory — it expired, or the server restarted — is answered from
 there. On start-up, runs a restart cut short are marked failed with a
-message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted.
+message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted;
+while the server stays up they are deleted once an hour, and each new run
+trims its owner's finished runs to the newest `MAX_STORED_RUNS_PER_USER`.
 Users can read their own runs from the table; nobody but the server can
 write them. Without the key, runs live in memory only and are lost on a
 restart; the server logs a warning at start-up.

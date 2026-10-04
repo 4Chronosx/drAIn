@@ -91,6 +91,10 @@ class JobStoreClosedError(RuntimeError):
 #: The window the per-person run allowance is counted over.
 _RUN_WINDOW = timedelta(hours=1)
 
+#: Someone who has started at most this many runs in that window may take
+#: one of the queue's reserved places.
+LIGHT_USE_RUNS = 2
+
 
 @dataclass(eq=False)
 class _Entry:
@@ -121,6 +125,12 @@ class JobStore:
     hung run held the only worker and everything behind it waited forever.
     The server runs each SWMM run in a child process (:mod:`app.isolation`)
     that is killed at the same limit, so in practice the thread is freed too.
+
+    The last ``reserved_slots`` places in the queue are kept for owners who
+    have started at most :data:`LIGHT_USE_RUNS` runs in the past hour. The
+    hourly allowance alone let a handful of accounts, each within it, hold
+    every place; this leaves room for someone running their first. Order in
+    the queue is unchanged: it decides who gets in, not who goes first.
     """
 
     def __init__(
@@ -134,10 +144,13 @@ class JobStore:
         max_runs_per_owner_per_hour: int | None = None,
         listener: Callable[[SimulationJob], None] | None = None,
         max_jobs_per_group: int | None = None,
+        reserved_slots: int = 0,
     ) -> None:
         self._max_workers = max_workers
         self._executor = self._new_executor()
         self._max_queued = max_queued
+        # Always leaves at least one place anyone may take.
+        self._reserved_slots = max(0, min(reserved_slots, max_queued - 1))
         self._retention = retention
         self._max_runtime = max_runtime
         self._max_queue_wait = max_queue_wait
@@ -234,6 +247,15 @@ class JobStore:
             outstanding = self._outstanding()
             if outstanding >= self._max_queued:
                 raise QueueFullError(f"{outstanding} simulations are already queued or running.")
+            if (
+                owner is not None
+                and outstanding >= self._max_queued - self._reserved_slots
+                and self._runs_this_hour(owner, prior_runs or 0) > LIGHT_USE_RUNS
+            ):
+                raise QueueFullError(
+                    f"{outstanding} simulations are already queued or running, and the "
+                    "remaining places are kept for people who have run fewer this hour."
+                )
 
             entry = _Entry(
                 job=SimulationJob(id=str(uuid.uuid4()), owner=owner, request=request),
@@ -286,18 +308,23 @@ class JobStore:
                 )
 
         if self._max_runs_per_owner_per_hour is not None:
-            recent = self._recent_runs.get(owner)
-            cutoff = _now() - _RUN_WINDOW
-            while recent and recent[0] < cutoff:
-                recent.popleft()
-            if recent is not None and not recent:
-                del self._recent_runs[owner]
-            started = max(len(recent or ()), prior_runs)
+            started = self._runs_this_hour(owner, prior_runs)
             if started >= self._max_runs_per_owner_per_hour:
                 raise UserLimitError(
                     f"You have started {started} simulations in the past hour, "
                     "the most allowed. Try again later."
                 )
+
+    def _runs_this_hour(self, owner: str, prior_runs: int = 0) -> int:
+        """Runs ``owner`` started in the past hour: this process's count or
+        the outside one, whichever is larger. Caller holds the lock."""
+        recent = self._recent_runs.get(owner)
+        cutoff = _now() - _RUN_WINDOW
+        while recent and recent[0] < cutoff:
+            recent.popleft()
+        if recent is not None and not recent:
+            del self._recent_runs[owner]
+        return max(len(recent or ()), prior_runs)
 
     def _notify(self, job: SimulationJob) -> None:
         """Tell the listener about a change. Caller holds the lock."""
@@ -431,6 +458,13 @@ class JobStore:
             self._groups.pop(job_id, None)
         if expired:
             logger.debug("Dropped %d expired simulation results", len(expired))
+
+        # An owner's count was only cleared when they next submitted, so
+        # everyone who ran once and never came back stayed here for good.
+        window_start = now - _RUN_WINDOW
+        idle = [owner for owner, runs in self._recent_runs.items() if runs[-1] < window_start]
+        for owner in idle:
+            del self._recent_runs[owner]
 
     def _replace_executor(self) -> None:
         """Move queued work to a fresh pool. Caller holds the lock.

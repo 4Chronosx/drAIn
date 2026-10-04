@@ -7,6 +7,7 @@ trigger at will.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import time
@@ -25,22 +26,51 @@ logger = logging.getLogger(__name__)
 MAX_TRACKED_CLIENTS = 10_000
 
 
+#: An IPv6 customer is handed at least a /64, and can use any address in
+#: it. Limited per address, they would have 2**64 allowances.
+IPV6_CLIENT_PREFIX = 64
+
+
+def _limit_key(address: str) -> str | None:
+    """What an address is limited as, or ``None`` if it isn't an address.
+
+    An IPv4 address is itself, also when written as an IPv4-mapped IPv6
+    one; an IPv6 address is its /64 network.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv4Address):
+        return str(parsed)
+    if parsed.ipv4_mapped is not None:
+        return str(parsed.ipv4_mapped)
+    return str(ipaddress.IPv6Network((int(parsed), IPV6_CLIENT_PREFIX), strict=False))
+
+
 def client_ip(scope: Scope, proxy_hops: int) -> str:
-    """The caller's address, as far as it can be trusted.
+    """The caller's address, as far as it can be trusted, as a key to limit
+    them by (:func:`_limit_key`).
 
     Each proxy appends the address it heard from to X-Forwarded-For, so the
     entry ``proxy_hops`` from the right is the one the outermost trusted
     proxy saw. Anything left of it was written by the caller and could say
     anything. (Uvicorn's own ``--forwarded-allow-ips='*'`` takes the leftmost
-    entry, which the caller chooses.)
+    entry, which the caller chooses.) An entry there that is not an address
+    did not come from the proxy, and the connection's own address is used.
     """
     if proxy_hops > 0:
         forwarded = ",".join(Headers(scope=scope).getlist("x-forwarded-for"))
         hops = [entry.strip() for entry in forwarded.split(",") if entry.strip()]
         if len(hops) >= proxy_hops:
-            return hops[-proxy_hops]
+            key = _limit_key(hops[-proxy_hops])
+            if key is not None:
+                return key
     client = scope.get("client")
-    return client[0] if client else "unknown"
+    if not client:
+        return "unknown"
+    # A peer that is not an address (a Unix socket's path) stays as it is.
+    return _limit_key(client[0]) or client[0]
 
 
 class BodySizeLimitMiddleware:

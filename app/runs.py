@@ -11,6 +11,11 @@ through a single background thread, in order, so a slow database never
 holds up a request or a simulation. A failed write is logged and dropped:
 the run itself matters more than its record.
 
+The same thread keeps the table bounded while the server stays up: each new
+run trims its owner's rows to the newest few, and once an hour runs past
+the retention window are deleted. Start-up used to be the only time
+anything was deleted, so a server that never restarted never cleaned up.
+
 The table is defined in the frontend repository's
 ``supabase/schemas/schema_ops.sql``.
 """
@@ -21,13 +26,14 @@ import json
 import logging
 import queue
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from app.jobs import JobStatus, SimulationJob
@@ -59,6 +65,9 @@ class RunRepository(Protocol):
     def count_recent(self, owner: str, since: datetime, limit: int) -> int:
         """How many runs ``owner`` created since ``since``, counting to ``limit``."""
 
+    def trim_owner(self, owner: str, keep: int) -> None:
+        """Delete ``owner``'s finished runs beyond their newest ``keep``."""
+
 
 #: Takes (method, url, headers, body, timeout) and returns (HTTP status, body).
 Fetch = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, bytes]]
@@ -72,6 +81,14 @@ LOAD_TIMEOUT_SECONDS = 5.0
 #: Seconds the count behind a new run may take. A request waits on it, so
 #: past this the server counts from memory instead.
 COUNT_TIMEOUT_SECONDS = 3.0
+
+
+#: The most rows one trim deletes, which bounds the length of its request.
+#: An owner further over than this is brought down over their next runs.
+TRIM_BATCH = 100
+
+#: Seconds between prunes by age while the server is up.
+PRUNE_INTERVAL_SECONDS = 3600.0
 
 
 def _urllib_fetch(
@@ -226,6 +243,34 @@ class SupabaseRunRepository:
         rows = json.loads(self._call("GET", query, timeout=COUNT_TIMEOUT_SECONDS) or b"[]")
         return len(rows)
 
+    def trim_owner(self, owner: str, keep: int) -> None:
+        if not is_uuid(owner):
+            return
+        beyond = "?" + urllib.parse.urlencode(
+            {
+                "select": "id",
+                "user_id": f"eq.{owner}",
+                "order": "created_at.desc",
+                "offset": str(keep),
+                "limit": str(TRIM_BATCH),
+            }
+        )
+        rows = json.loads(self._call("GET", beyond) or b"[]")
+        ids = [row["id"] for row in rows if is_uuid(row.get("id"))]
+        if not ids:
+            return
+        # Never a run still queued or running, however far down the list:
+        # its row is about to be written to again.
+        query = "?" + urllib.parse.urlencode(
+            {
+                "id": f"in.({','.join(ids)})",
+                "user_id": f"eq.{owner}",
+                "status": "in.(succeeded,failed)",
+            },
+            safe="(),",
+        )
+        self._call("DELETE", query, prefer="return=minimal")
+
 
 _STOP = object()
 
@@ -241,10 +286,28 @@ class RunRecorder:
     The job store calls :meth:`record` with a snapshot each time a run is
     queued, starts or finishes, sometimes while holding its lock, so this
     only puts the snapshot on a queue.
+
+    With ``max_runs_per_owner``, each newly queued run trims its owner's
+    rows to that many; with ``retention``, runs older than it are deleted
+    at most once an hour. Both happen on the same thread, after the write.
     """
 
-    def __init__(self, repository: RunRepository, max_pending: int = MAX_PENDING_WRITES) -> None:
+    def __init__(
+        self,
+        repository: RunRepository,
+        max_pending: int = MAX_PENDING_WRITES,
+        *,
+        retention: timedelta | None = None,
+        max_runs_per_owner: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._repository = repository
+        self._retention = retention
+        self._max_runs_per_owner = max_runs_per_owner
+        self._clock = clock
+        # Start-up prunes once itself (app.main), so the first prune from
+        # here is an hour after that. Only the writer thread reads this.
+        self._pruned_at = clock()
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
         self._closed = False
         self._thread = threading.Thread(target=self._drain, name="run-recorder", daemon=True)
@@ -319,3 +382,24 @@ class RunRecorder:
                 self._repository.save(item)
             except Exception:
                 logger.exception("Could not record simulation %s (%s)", item.id, item.status)
+                continue
+            if item.status is JobStatus.QUEUED:
+                self._tidy(item)
+
+    def _tidy(self, job: SimulationJob) -> None:
+        """Keep the table bounded, now that ``job`` has added a row to it."""
+        if self._max_runs_per_owner is not None and job.owner is not None:
+            try:
+                self._repository.trim_owner(job.owner, self._max_runs_per_owner)
+            except Exception:
+                logger.exception("Could not trim the stored runs of %s", job.owner)
+        now = self._clock()
+        if self._retention is None or now - self._pruned_at < PRUNE_INTERVAL_SECONDS:
+            return
+        # Stamped first, so a table that can't be pruned is tried again in
+        # an hour rather than on every run.
+        self._pruned_at = now
+        try:
+            self._repository.prune(datetime.now(UTC) - self._retention)
+        except Exception:
+            logger.exception("Could not prune recorded simulation runs")

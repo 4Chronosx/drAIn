@@ -95,6 +95,11 @@ class Settings:
     #: one -- can grow a backlog nobody is waiting on any more.
     max_queued_simulations: int = 8
 
+    #: The last places in that queue are kept for people who have started
+    #: at most two runs in the past hour, so a few heavy users can't fill it
+    #: against everyone else. 0 keeps none back.
+    queue_slots_reserved: int = 2
+
     #: How long a finished job's result stays available to poll for. Each
     #: result is close to a megabyte, so they cannot be kept forever.
     result_retention_seconds: int = 900
@@ -121,6 +126,12 @@ class Settings:
 
     #: How long recorded runs are kept in Supabase.
     run_retention_days: int = 7
+
+    #: Recorded runs kept per person; a new run deletes their oldest finished
+    #: ones beyond it. A result is close to a megabyte, so ten runs an hour
+    #: for a week would otherwise be a gigabyte from one account. 0 keeps
+    #: them all until they age out.
+    max_stored_runs_per_user: int = 20
 
     #: Refuse simulations from anyone not signed in. Only a local developer
     #: without a Supabase project should turn this off.
@@ -176,6 +187,7 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
             max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
+            queue_slots_reserved=int(os.getenv("QUEUE_SLOTS_RESERVED", "2")),
             result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
             max_runtime_seconds=int(os.getenv("MAX_RUNTIME_SECONDS", "1800")),
             max_queue_wait_seconds=int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "3600")),
@@ -183,6 +195,7 @@ class Settings:
             supabase_anon_key=os.getenv("SUPABASE_ANON_KEY") or None,
             supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
             run_retention_days=int(os.getenv("RUN_RETENTION_DAYS", "7")),
+            max_stored_runs_per_user=int(os.getenv("MAX_STORED_RUNS_PER_USER", "20")),
             require_auth=_env_flag("REQUIRE_AUTH", True),
             max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
             max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),

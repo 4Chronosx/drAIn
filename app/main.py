@@ -98,6 +98,7 @@ def _build_job_store(config: Settings, listener=None) -> JobStore:
         max_runs_per_owner_per_hour=config.max_runs_per_user_per_hour,
         listener=listener,
         max_jobs_per_group=config.max_jobs_per_ip,
+        reserved_slots=config.queue_slots_reserved,
     )
 
 
@@ -304,7 +305,15 @@ def create_app(
     run record."""
     auth = authenticator if authenticator is not None else _build_authenticator(config)
     repository = runs if runs is not None else _build_run_repository(config)
-    recorder = RunRecorder(repository) if repository is not None else None
+    recorder = (
+        RunRecorder(
+            repository,
+            retention=timedelta(days=config.run_retention_days),
+            max_runs_per_owner=config.max_stored_runs_per_user or None,
+        )
+        if repository is not None
+        else None
+    )
     jobs = _build_job_store(config, listener=recorder.record if recorder else None)
     rendered = RenderedStates(ttl_seconds=config.result_retention_seconds)
 
@@ -312,6 +321,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         """Set up logging, and settle runs a restart cut short."""
         configure_logging(config.log_level)
+        isolation.sweep_stale_directories(older_than=config.max_runtime_seconds)
         if repository is not None:
             # This process has run nothing yet, so any run still marked
             # queued or running belonged to the one before it, and died with

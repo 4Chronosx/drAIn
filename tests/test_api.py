@@ -45,6 +45,7 @@ TEST_SETTINGS = replace(
     max_jobs_per_user=100,
     max_runs_per_user_per_hour=1000,
     max_jobs_per_ip=100,
+    queue_slots_reserved=0,
     submit_rate_per_minute=0,
     poll_rate_per_minute=0,
     isolate_simulations=False,

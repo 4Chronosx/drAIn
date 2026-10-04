@@ -165,6 +165,8 @@ def run_simulation(
 
     with tempfile.TemporaryDirectory(prefix="drain-sim-") as workdir:
         # Copy the network in so SWMM's output lands in the temp directory.
+        # In the server that is one the parent process owns and removes
+        # (app.isolation), since a killed run never leaves this block.
         inp_path = Path(workdir) / BASE_INP.name
         shutil.copyfile(BASE_INP, inp_path)
 
