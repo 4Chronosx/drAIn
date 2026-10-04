@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.config import Settings, _env_flag
+from app.config import Settings, _env_flag, deployment_problems, insecure_deploy_allowed
 
 
 class TestFlags:
@@ -53,3 +53,57 @@ class TestSecrets:
     def test_the_service_role_key_is_still_read_from_the_environment(self, monkeypatch):
         monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-secret")
         assert Settings.from_env().supabase_service_role_key == "service-secret"
+
+
+#: Render sets this in the environment of every service it runs.
+ON_RENDER = {"RENDER": "true"}
+
+
+class TestDeploymentProblems:
+    """What the server checks before it starts on Render, which says where
+    it is by setting ``RENDER`` in the environment."""
+
+    SOUND = Settings(require_auth=True, trusted_proxy_hops=1)
+
+    def test_sound_settings_have_none(self):
+        assert deployment_problems(self.SOUND, ON_RENDER) == []
+
+    def test_sign_in_turned_off_is_one(self):
+        config = Settings(require_auth=False, trusted_proxy_hops=1)
+        (problem,) = deployment_problems(config, ON_RENDER)
+        assert "REQUIRE_AUTH" in problem
+
+    def test_no_trusted_proxy_is_one(self):
+        config = Settings(require_auth=True, trusted_proxy_hops=0)
+        (problem,) = deployment_problems(config, ON_RENDER)
+        assert "TRUSTED_PROXY_HOPS" in problem
+
+    def test_the_defaults_are_not_fit_to_deploy(self):
+        # They are a developer's: no proxy in front.
+        assert len(deployment_problems(Settings(), ON_RENDER)) == 1
+        assert len(deployment_problems(Settings(require_auth=False), ON_RENDER)) == 2
+
+    @pytest.mark.parametrize("environ", [{}, {"RENDER": ""}, {"RENDER": "  "}])
+    def test_nothing_is_checked_off_render(self, environ):
+        assert deployment_problems(Settings(require_auth=False), environ) == []
+
+    def test_the_real_environment_is_not_consulted(self, monkeypatch):
+        monkeypatch.setenv("RENDER", "true")
+        assert deployment_problems(Settings(), {}) == []
+
+    @pytest.mark.parametrize(
+        ("environ", "allowed"),
+        [
+            ({}, False),
+            ({"ALLOW_INSECURE_DEPLOY": ""}, False),
+            ({"ALLOW_INSECURE_DEPLOY": "false"}, False),
+            ({"ALLOW_INSECURE_DEPLOY": "true"}, True),
+            ({"ALLOW_INSECURE_DEPLOY": "1"}, True),
+        ],
+    )
+    def test_the_override_is_a_flag_like_any_other(self, environ, allowed):
+        assert insecure_deploy_allowed(environ) is allowed
+
+    def test_a_mistyped_override_is_an_error_not_a_yes(self):
+        with pytest.raises(ValueError, match="ALLOW_INSECURE_DEPLOY"):
+            insecure_deploy_allowed({"ALLOW_INSECURE_DEPLOY": "ture"})

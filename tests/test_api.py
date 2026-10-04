@@ -55,10 +55,12 @@ AS_A = {"Authorization": "Bearer token-a"}
 AS_B = {"Authorization": "Bearer token-b"}
 
 
-def make_app(authenticator=None, **overrides):
+def make_app(authenticator=None, environ=None, **overrides):
     return create_app(
         replace(TEST_SETTINGS, **overrides),
         authenticator=authenticator or FakeAuthenticator(),
+        # Empty unless a test says where it is deployed.
+        environ=environ or {},
     )
 
 
@@ -780,3 +782,64 @@ def test_real_preview_and_production_hostnames_may_when_allowed(preview_client, 
 def test_production_hostnames_may_by_default(client, origin):
     response = client.get("/health", headers={"Origin": origin})
     assert response.headers.get("access-control-allow-origin") == origin
+
+
+#: Render sets this in the environment of every service it runs.
+ON_RENDER = {"RENDER": "true"}
+
+
+class TestDeploymentGuard:
+    """Settings that suit a laptop reached the deployed server and it
+    started anyway: open to anyone, or with every caller sharing the
+    proxy's rate limit. On Render it now refuses to start."""
+
+    def test_a_deployment_without_sign_in_does_not_start(self):
+        app = make_app(environ=ON_RENDER, require_auth=False, trusted_proxy_hops=1)
+        with pytest.raises(RuntimeError, match="REQUIRE_AUTH"), TestClient(app):
+            pass
+
+    def test_a_deployment_that_cannot_tell_callers_apart_does_not_start(self):
+        app = make_app(environ=ON_RENDER, trusted_proxy_hops=0)
+        with pytest.raises(RuntimeError, match="TRUSTED_PROXY_HOPS"), TestClient(app):
+            pass
+
+    def test_a_sound_deployment_starts(self):
+        app = make_app(environ=ON_RENDER, trusted_proxy_hops=1)
+        with TestClient(app) as deployed:
+            assert deployed.get("/health").status_code == 200
+
+    def test_the_same_settings_start_anywhere_else(self):
+        app = make_app(environ={}, require_auth=False, trusted_proxy_hops=0)
+        with TestClient(app) as local:
+            assert local.get("/health").status_code == 200
+
+    def test_the_override_starts_it_anyway(self):
+        environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": "true"}
+        app = make_app(environ=environ, trusted_proxy_hops=0)
+        with TestClient(app) as deployed:
+            assert deployed.get("/health").status_code == 200
+
+    @pytest.mark.parametrize("value", ["false", "0", ""])
+    def test_an_override_that_is_off_does_not(self, value):
+        environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": value}
+        app = make_app(environ=environ, trusted_proxy_hops=0)
+        with pytest.raises(RuntimeError, match="Refusing to start"), TestClient(app):
+            pass
+
+    def test_each_problem_is_logged(self, monkeypatch):
+        logged = []
+        monkeypatch.setattr(
+            "app.main.logger.log", lambda level, message, *args: logged.append((level, args[0]))
+        )
+        app = make_app(environ=ON_RENDER, require_auth=False, trusted_proxy_hops=0)
+        with pytest.raises(RuntimeError), TestClient(app):
+            pass
+        assert [level for level, _ in logged] == [logging.ERROR, logging.ERROR]
+
+        logged.clear()
+        environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": "yes"}
+        app = make_app(environ=environ, require_auth=False, trusted_proxy_hops=0)
+        with TestClient(app):
+            pass
+        assert [level for level, _ in logged] == [logging.WARNING, logging.WARNING]
+        assert "REQUIRE_AUTH" in logged[0][1] and "TRUSTED_PROXY_HOPS" in logged[1][1]

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -22,7 +23,7 @@ from app.auth import (
     OpenAuthenticator,
     SupabaseAuthenticator,
 )
-from app.config import Settings, settings
+from app.config import Settings, deployment_problems, insecure_deploy_allowed, settings
 from app.jobs import (
     JobStore,
     JobStoreClosedError,
@@ -191,6 +192,28 @@ def _recent_runs(repository: RunRepository | None, owner: str, config: Settings)
         return None
 
 
+def _refuse_insecure_deployment(config: Settings, environ: Mapping[str, str]) -> None:
+    """Stop a deployed server from starting with settings that leave it open.
+
+    A warning in the log of a server that started anyway is read by nobody;
+    a deploy that fails is. ``ALLOW_INSECURE_DEPLOY`` starts it regardless.
+    """
+    problems = deployment_problems(config, environ)
+    if not problems:
+        return
+    allowed = insecure_deploy_allowed(environ)
+    for problem in problems:
+        logger.log(
+            logging.WARNING if allowed else logging.ERROR, "Insecure deployment: %s", problem
+        )
+    if not allowed:
+        raise RuntimeError(
+            "Refusing to start on Render with insecure settings: "
+            + " ".join(problems)
+            + " Fix them, or set ALLOW_INSECURE_DEPLOY=true to start anyway."
+        )
+
+
 def _as_state(job: SimulationJob) -> JobState:
     return JobState(
         job_id=job.id,
@@ -299,10 +322,11 @@ def create_app(
     config: Settings = settings,
     authenticator: Authenticator | None = None,
     runs: RunRepository | None = None,
+    environ: Mapping[str, str] = os.environ,
 ) -> FastAPI:
     """Build the application. Kept separate from the module-level instance so
-    tests can construct an app with their own settings, sign-in check and
-    run record."""
+    tests can construct an app with their own settings, sign-in check, run
+    record and environment (read at start-up for where the server runs)."""
     auth = authenticator if authenticator is not None else _build_authenticator(config)
     repository = runs if runs is not None else _build_run_repository(config)
     recorder = (
@@ -321,6 +345,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         """Set up logging, and settle runs a restart cut short."""
         configure_logging(config.log_level)
+        _refuse_insecure_deployment(config, environ)
         isolation.sweep_stale_directories(older_than=config.max_runtime_seconds)
         if repository is not None:
             # This process has run nothing yet, so any run still marked

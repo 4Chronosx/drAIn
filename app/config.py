@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 #: Origins always permitted, covering local development and the named
@@ -58,13 +59,13 @@ _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
 
-def _env_flag(name: str, default: bool) -> bool:
+def _env_flag(name: str, default: bool, environ: Mapping[str, str] = os.environ) -> bool:
     """A switch from the environment; unset or empty means ``default``.
 
     Anything that is not a known spelling is an error. It used to count as
     on, so ``ENABLE_DOCS=flase`` served the docs.
     """
-    raw = os.getenv(name)
+    raw = environ.get(name)
     if raw is None or not raw.strip():
         return default
     value = raw.strip().lower()
@@ -208,6 +209,33 @@ class Settings:
             isolate_simulations=_env_flag("ISOLATE_SIMULATIONS", True),
             enable_docs=_env_flag("ENABLE_DOCS", False),
         )
+
+
+def deployment_problems(config: Settings, environ: Mapping[str, str]) -> list[str]:
+    """What is unsafe about these settings for where the server is running.
+
+    The defaults suit a developer's machine, and nothing stopped them, or a
+    setting meant for one, from reaching the deployed server: it started
+    and served, open or with every caller sharing one rate limit. Render
+    sets ``RENDER`` in every service's environment; anywhere else there is
+    nothing to check against, and this is empty.
+    """
+    if not environ.get("RENDER", "").strip():
+        return []
+    problems = []
+    if not config.require_auth:
+        problems.append("REQUIRE_AUTH is off, so anyone can run simulations.")
+    if config.trusted_proxy_hops < 1:
+        problems.append(
+            "TRUSTED_PROXY_HOPS is 0, so every caller is seen as Render's proxy and "
+            "they all share one rate limit. Set it to 1."
+        )
+    return problems
+
+
+def insecure_deploy_allowed(environ: Mapping[str, str]) -> bool:
+    """Whether ``ALLOW_INSECURE_DEPLOY`` says to start despite such problems."""
+    return _env_flag("ALLOW_INSECURE_DEPLOY", False, environ)
 
 
 settings = Settings.from_env()

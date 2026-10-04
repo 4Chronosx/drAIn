@@ -10,18 +10,18 @@
 </a>
 
 <div align="center">
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin">
+  <a href="https://github.com/4Chronosx/drAIn">
     <img src="logo.png" alt="drAIn Backend logo" width="40%" height="35%">
   </a>
   <br />
   <p align="center">
     <a href="#"><img alt="Status" src="https://img.shields.io/badge/status-Beta-yellow?style=flat&color=yellow" /></a>
     <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
-    <a href="https://github.com/4Chronosx/BACKEND-DrAin/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/BACKEND-DrAin?color=coral&logo=git&logoColor=white" /></a>
+    <a href="https://github.com/4Chronosx/drAIn/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/drAIn?color=coral&logo=git&logoColor=white" /></a>
   </p>
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
+  <a href="https://github.com/4Chronosx/drAIn/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
   &middot;
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
+  <a href="https://github.com/4Chronosx/drAIn/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
 </div>
 
 ---
@@ -155,8 +155,8 @@ The SWMM engine ships with `pyswmm`, so no separate install is needed.
 
 ```bash
 # Clone the repository
-git clone https://github.com/4Chronosx/BACKEND-DrAin.git
-cd BACKEND-DrAin
+git clone https://github.com/4Chronosx/drAIn.git
+cd drAIn
 
 # Create virtual environment
 python -m venv venv
@@ -202,8 +202,8 @@ python -m drain.cli --precip 400 --duration 24 --node I-4
 
 ```bash
 pytest
-ruff check drain app tests
-ruff format --check drain app tests
+ruff check app drain tests scripts
+ruff format --check app drain tests scripts
 ```
 
 ### 🔧 Configuration
@@ -237,6 +237,10 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_REQUEST_BYTES` | `655360` | Largest request body accepted (`413` above it). The biggest real request, every node and link with every field, is about 495 KB |
 | `ISOLATE_SIMULATIONS` | `true` | Run each simulation in a child process that is killed at `MAX_RUNTIME_SECONDS` |
 | `ENABLE_DOCS` | `false` | Serve `/docs`, `/redoc` and `/openapi.json` |
+| `ALLOW_INSECURE_DEPLOY` | `false` | Start on Render even with `REQUIRE_AUTH` off or `TRUSTED_PROXY_HOPS` at `0`, which otherwise stop the server starting there (see Deployment) |
+
+A switch takes `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0`. Anything
+else is an error at start-up rather than a guess.
 
 Without `SUPABASE_URL` and `SUPABASE_ANON_KEY` the server refuses every
 simulation with `503` rather than opening them to everyone. To try the API
@@ -429,17 +433,25 @@ The backend is deployed on Render and serves the production API:
 
 `Procfile` starts `app.main:app` and binds `$PORT`.
 
-In production, also set:
+**The server refuses to start on Render** (where `RENDER` is set in the
+environment) unless `TRUSTED_PROXY_HOPS` is at least `1` and `REQUIRE_AUTH`
+is on. It logs what is wrong and exits, so the deploy fails instead of
+serving open or with one rate limit shared by everyone. Setting
+`ALLOW_INSECURE_DEPLOY=true` starts it anyway, with warnings.
 
-- `TRUSTED_PROXY_HOPS=1`. Render's proxy connects to the app, so without it
-  every caller has the proxy's address and they all share one rate limit.
+Before the first deploy, set:
+
+- `TRUSTED_PROXY_HOPS=1` (**required**). Render's proxy connects to the
+  app, so without it every caller has the proxy's address and they all
+  share one rate limit.
   The server reads the address the proxy appended to `X-Forwarded-For`, not
   the leftmost entry, which the caller writes. (Uvicorn's
   `--forwarded-allow-ips='*'` takes the leftmost, so it is not used.) If
   another proxy, such as a CDN, sits in front of Render, count it too. The
   server logs a warning if it sees `X-Forwarded-For` while this is `0`.
 - `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`.
-- Leave `ENABLE_DOCS` unset.
+- Leave `REQUIRE_AUTH` unset or `true` (**required**).
+- Leave `ENABLE_DOCS` and `ALLOW_INSECURE_DEPLOY` unset.
 
 ---
 
@@ -456,8 +468,8 @@ Don't forget to give the project a star! Thanks again!
 
 ### 📢 Contributors
 
-<a href="https://github.com/4Chronosx/BACKEND-DrAin/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=4Chronosx/BACKEND-DrAin" alt="contrib.rocks image" />
+<a href="https://github.com/4Chronosx/drAIn/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=4Chronosx/drAIn" alt="contrib.rocks image" />
 </a>
 
 ---
@@ -478,12 +490,12 @@ You may redistribute and/or modify it under the terms of the GNU GPL, as publish
 <p align="center">Made with 💧 for flood-resilient cities</p>
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[contributors-shield]: https://img.shields.io/github/contributors/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[contributors-url]: https://github.com/4Chronosx/BACKEND-DrAin/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[forks-url]: https://github.com/4Chronosx/BACKEND-DrAin/network/members
-[stars-shield]: https://img.shields.io/github/stars/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[stars-url]: https://github.com/4Chronosx/BACKEND-DrAin/stargazers
-[issues-shield]: https://img.shields.io/github/issues/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[issues-url]: https://github.com/4Chronosx/BACKEND-DrAin/issues
+[contributors-shield]: https://img.shields.io/github/contributors/4Chronosx/drAIn.svg?style=for-the-badge
+[contributors-url]: https://github.com/4Chronosx/drAIn/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/4Chronosx/drAIn.svg?style=for-the-badge
+[forks-url]: https://github.com/4Chronosx/drAIn/network/members
+[stars-shield]: https://img.shields.io/github/stars/4Chronosx/drAIn.svg?style=for-the-badge
+[stars-url]: https://github.com/4Chronosx/drAIn/stargazers
+[issues-shield]: https://img.shields.io/github/issues/4Chronosx/drAIn.svg?style=for-the-badge
+[issues-url]: https://github.com/4Chronosx/drAIn/issues
 
