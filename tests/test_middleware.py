@@ -64,3 +64,44 @@ class TestClientIp:
 
     def test_too_few_entries_falls_back_to_the_connection(self):
         assert client_ip(scope(forwarded=[]), 1) == "192.0.2.10"
+
+    def test_a_connection_without_a_peer_is_unknown(self):
+        assert client_ip({"type": "http", "client": None, "headers": []}, 0) == "unknown"
+
+
+class TestAddressesAsLimitKeys:
+    """An IPv6 customer holds a whole /64 and can send from any address in
+    it. Limited per address, one caller had as many allowances as they
+    cared to use."""
+
+    def test_two_addresses_in_one_ipv6_network_share_a_key(self):
+        first = client_ip(scope(forwarded=["2001:db8:1:2::1"]), 1)
+        second = client_ip(scope(forwarded=["2001:db8:1:2:ffff:abcd:0:9"]), 1)
+        assert first == second == "2001:db8:1:2::/64"
+
+    def test_different_ipv6_networks_do_not(self):
+        first = client_ip(scope(forwarded=["2001:db8:1:2::1"]), 1)
+        second = client_ip(scope(forwarded=["2001:db8:1:3::1"]), 1)
+        assert first != second
+
+    def test_an_ipv4_address_written_as_ipv6_is_that_ipv4_address(self):
+        assert client_ip(scope(forwarded=["::ffff:203.0.113.5"]), 1) == "203.0.113.5"
+
+    def test_an_ipv6_peer_is_keyed_the_same_way(self):
+        assert client_ip(scope(peer="2001:db8:1:2::1"), 0) == "2001:db8:1:2::/64"
+        assert client_ip(scope(peer="::ffff:192.0.2.10"), 0) == "192.0.2.10"
+
+    @pytest.mark.parametrize(
+        "entry", ["not-an-address", "203.0.113.5:4321", "unknown", "999.1.1.1"]
+    )
+    def test_a_forwarded_entry_that_is_not_an_address_falls_back_to_the_peer(self, entry):
+        assert client_ip(scope(forwarded=[f"203.0.113.5, {entry}"]), 1) == "192.0.2.10"
+
+    def test_a_peer_that_is_not_an_address_is_kept_as_it_is(self):
+        assert client_ip(scope(peer="testclient"), 0) == "testclient"
+
+    def test_the_limiter_counts_a_network_as_one_caller(self):
+        bucket = TokenBucket(1, Clock())
+        assert bucket.take(client_ip(scope(forwarded=["2001:db8:1:2::1"]), 1)) == 0
+        assert bucket.take(client_ip(scope(forwarded=["2001:db8:1:2::2"]), 1)) > 0
+        assert bucket.take(client_ip(scope(forwarded=["2001:db8:1:3::1"]), 1)) == 0

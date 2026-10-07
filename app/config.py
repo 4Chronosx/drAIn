@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 #: Origins always permitted, covering local development and the named
 #: production deployments.
@@ -54,11 +55,27 @@ def _env_list(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _env_flag(name: str, default: bool, environ: Mapping[str, str] = os.environ) -> bool:
+    """A switch from the environment; unset or empty means ``default``.
+
+    Anything that is not a known spelling is an error. It used to count as
+    on, so ``ENABLE_DOCS=flase`` served the docs.
+    """
+    raw = environ.get(name)
     if raw is None or not raw.strip():
         return default
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, yes/no, on/off or 1/0, not {raw.strip()!r}."
+    )
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,11 @@ class Settings:
     #: requests with 429. Without a cap, a burst of callers -- or a bored
     #: one -- can grow a backlog nobody is waiting on any more.
     max_queued_simulations: int = 8
+
+    #: The last places in that queue are kept for people who have started
+    #: at most two runs in the past hour, so a few heavy users can't fill it
+    #: against everyone else. 0 keeps none back.
+    queue_slots_reserved: int = 2
 
     #: How long a finished job's result stays available to poll for. Each
     #: result is close to a megabyte, so they cannot be kept forever.
@@ -99,11 +121,18 @@ class Settings:
     supabase_anon_key: str | None = None
     #: The project's service-role key. With it, every run is also recorded in
     #: the simulation_runs table, so results survive a restart. A secret:
-    #: set it only in the host's environment.
-    supabase_service_role_key: str | None = None
+    #: set it only in the host's environment, and kept out of the repr so a
+    #: logged or printed Settings doesn't carry it.
+    supabase_service_role_key: str | None = field(default=None, repr=False)
 
     #: How long recorded runs are kept in Supabase.
     run_retention_days: int = 7
+
+    #: Recorded runs kept per person; a new run deletes their oldest finished
+    #: ones beyond it. A result is close to a megabyte, so ten runs an hour
+    #: for a week would otherwise be a gigabyte from one account. 0 keeps
+    #: them all until they age out.
+    max_stored_runs_per_user: int = 20
 
     #: Refuse simulations from anyone not signed in. Only a local developer
     #: without a Supabase project should turn this off.
@@ -159,6 +188,7 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
             max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
+            queue_slots_reserved=int(os.getenv("QUEUE_SLOTS_RESERVED", "2")),
             result_retention_seconds=int(os.getenv("RESULT_RETENTION_SECONDS", "900")),
             max_runtime_seconds=int(os.getenv("MAX_RUNTIME_SECONDS", "1800")),
             max_queue_wait_seconds=int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "3600")),
@@ -166,6 +196,7 @@ class Settings:
             supabase_anon_key=os.getenv("SUPABASE_ANON_KEY") or None,
             supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
             run_retention_days=int(os.getenv("RUN_RETENTION_DAYS", "7")),
+            max_stored_runs_per_user=int(os.getenv("MAX_STORED_RUNS_PER_USER", "20")),
             require_auth=_env_flag("REQUIRE_AUTH", True),
             max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
             max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),
@@ -178,6 +209,33 @@ class Settings:
             isolate_simulations=_env_flag("ISOLATE_SIMULATIONS", True),
             enable_docs=_env_flag("ENABLE_DOCS", False),
         )
+
+
+def deployment_problems(config: Settings, environ: Mapping[str, str]) -> list[str]:
+    """What is unsafe about these settings for where the server is running.
+
+    The defaults suit a developer's machine, and nothing stopped them, or a
+    setting meant for one, from reaching the deployed server: it started
+    and served, open or with every caller sharing one rate limit. Render
+    sets ``RENDER`` in every service's environment; anywhere else there is
+    nothing to check against, and this is empty.
+    """
+    if not environ.get("RENDER", "").strip():
+        return []
+    problems = []
+    if not config.require_auth:
+        problems.append("REQUIRE_AUTH is off, so anyone can run simulations.")
+    if config.trusted_proxy_hops < 1:
+        problems.append(
+            "TRUSTED_PROXY_HOPS is 0, so every caller is seen as Render's proxy and "
+            "they all share one rate limit. Set it to 1."
+        )
+    return problems
+
+
+def insecure_deploy_allowed(environ: Mapping[str, str]) -> bool:
+    """Whether ``ALLOW_INSECURE_DEPLOY`` says to start despite such problems."""
+    return _env_flag("ALLOW_INSECURE_DEPLOY", False, environ)
 
 
 settings = Settings.from_env()

@@ -5,5 +5,6 @@
 # Rate limits key on the caller's address. Behind Render's proxy, set
 # TRUSTED_PROXY_HOPS=1 in the environment so that is the caller's, not the
 # proxy's; uvicorn's own --forwarded-allow-ips='*' would trust an address
-# the caller wrote.
+# the caller wrote. On Render the server refuses to start without it, or
+# with REQUIRE_AUTH off (ALLOW_INSECURE_DEPLOY=true overrides).
 web: uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1

@@ -17,7 +17,13 @@ from app.main import RESTARTED_MESSAGE, create_app
 from app.runs import RunRecorder, RunStoreError, SupabaseRunRepository
 from app.simulation import BASELINE_MARKER, baseline_result
 from drain.model_info import network_sha256
-from tests.test_api import AS_A, AS_B, TEST_SETTINGS, FakeAuthenticator
+from tests.test_api import (
+    AS_A,
+    AS_B,
+    TEST_SETTINGS,
+    FakeAuthenticator,
+    poll_until_finished,
+)
 
 USER_A = "00000000-0000-4000-a000-00000000000a"
 USER_B = "00000000-0000-4000-a000-00000000000b"
@@ -124,6 +130,46 @@ class TestSupabaseRunRepository:
         with pytest.raises(RunStoreError):
             repository(FakePostgrest(500, b"boom")).save(finished_job())
 
+    def test_a_trim_deletes_an_owners_finished_runs_beyond_the_newest(self):
+        fake = FakePostgrest(200, json.dumps([{"id": JOB_ID}]).encode())
+        repository(fake).trim_owner(USER_A, keep=20)
+
+        (looked_up, listing, _, _), (deleted, deletion, _, _) = fake.calls
+        assert looked_up == "GET"
+        assert f"user_id=eq.{USER_A}" in listing
+        assert "order=created_at.desc" in listing and "offset=20" in listing
+        assert deleted == "DELETE"
+        assert f"id=in.({JOB_ID})" in deletion
+        assert f"user_id=eq.{USER_A}" in deletion
+        # A run still going keeps its row however many came after it.
+        assert "status=in.(succeeded,failed)" in deletion
+
+    def test_a_trim_with_nothing_beyond_the_newest_deletes_nothing(self):
+        fake = FakePostgrest(200, b"[]")
+        repository(fake).trim_owner(USER_A, keep=20)
+        assert [method for method, *_ in fake.calls] == ["GET"]
+
+    def test_a_trim_only_names_real_ids(self):
+        fake = FakePostgrest(200, json.dumps([{"id": "x),status=neq.(y"}]).encode())
+        repository(fake).trim_owner(USER_A, keep=20)
+        assert [method for method, *_ in fake.calls] == ["GET"]
+
+    def test_a_non_account_owner_is_never_trimmed(self):
+        fake = FakePostgrest(200, b"[]")
+        repository(fake).trim_owner("local-dev", keep=20)
+        assert fake.calls == []
+
+    def test_reading_a_run_back_does_not_wait_as_long_as_a_write(self):
+        # A poll waits on the read; the writes' 30 s would hold its thread.
+        fake = FakePostgrest(200, b"[]")
+        repository(fake).load(JOB_ID)
+        assert fake.timeouts == [5.0]
+
+    def test_the_service_role_key_is_not_in_the_repr(self):
+        shown = repr(repository(FakePostgrest()))
+        assert "service-key" not in shown
+        assert "p.supabase.co" in shown
+
 
 class MemoryRepository:
     """Keeps rows in a dict, the way the table would."""
@@ -133,6 +179,7 @@ class MemoryRepository:
         self.saves: list[SimulationJob] = []
         self.failed_unfinished = []
         self.pruned = []
+        self.trimmed = []
 
     def save(self, job):
         self.saves.append(job)
@@ -152,6 +199,19 @@ class MemoryRepository:
     def count_recent(self, owner, since, limit):
         recent = [job for job in self.rows.values() if job.owner == owner]
         return min(limit, len([job for job in recent if job.created_at >= since]))
+
+    def trim_owner(self, owner, keep):
+        self.trimmed.append((owner, keep))
+        # Two runs can share a created_at on a coarse clock (Windows ticks every
+        # ~15 ms); the later-saved one then counts as newer.
+        mine = sorted(
+            reversed([job for job in self.rows.values() if job.owner == owner]),
+            key=lambda job: job.created_at,
+            reverse=True,
+        )
+        for job in mine[keep:]:
+            if job.is_finished:
+                del self.rows[job.id]
 
 
 class TestRunRecorder:
@@ -455,3 +515,218 @@ class TestUnknownRunsAreRemembered:
                 assert client.get(f"/simulations/{JOB_ID}").status_code == 200
             assert client.get(f"/simulations/{JOB_ID}", headers=AS_B).status_code == 404
         assert Counting.loads == 1
+
+    def test_someone_elses_stored_result_is_not_rendered_for_them(self, monkeypatch):
+        rendered = []
+        monkeypatch.setattr("app.main.render", lambda job: rendered.append(job))
+        memory = MemoryRepository()
+        memory.rows[JOB_ID] = finished_job()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_B) as client:
+            assert client.get(f"/simulations/{JOB_ID}").status_code == 404
+        assert rendered == []
+
+
+class TestJobIdsAreChecked:
+    """The id in a poll's path is the caller's to write. Only the form the
+    job store issues is looked up; ``uuid.UUID`` also takes braces, a urn
+    prefix and bare hex, and each spelling was a separate cache entry and a
+    separate question to Supabase."""
+
+    LETTERED_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    class Counting(MemoryRepository):
+        def __init__(self):
+            super().__init__()
+            self.loads = []
+
+        def load(self, job_id):
+            self.loads.append(job_id)
+            return super().load(job_id)
+
+    @pytest.mark.parametrize(
+        "job_id",
+        [
+            "nope",
+            JOB_ID.replace("-", ""),
+            "{" + JOB_ID + "}",
+            "urn:uuid:" + JOB_ID,
+            JOB_ID + "0",
+            JOB_ID[:-1] + "g",
+        ],
+    )
+    def test_a_malformed_id_is_not_found_without_being_looked_up(self, monkeypatch, job_id):
+        remembered = []
+        monkeypatch.setattr(
+            "app.polling.RenderedStates.mark_unknown",
+            lambda self, unknown: remembered.append(unknown),
+        )
+        memory = self.Counting()
+        memory.rows[JOB_ID] = finished_job()
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            response = client.get(f"/simulations/{job_id}")
+        assert response.status_code == 404
+        assert "expired" in response.json()["detail"]
+        assert memory.loads == [] and remembered == []
+
+    def test_an_id_in_capitals_is_the_same_run(self):
+        memory = self.Counting()
+        memory.rows[self.LETTERED_ID] = finished_job(id=self.LETTERED_ID)
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=memory)
+        with TestClient(app, headers=AS_A) as client:
+            for job_id in (self.LETTERED_ID.upper(), self.LETTERED_ID):
+                response = client.get(f"/simulations/{job_id}")
+                assert response.status_code == 200
+                assert response.json()["job_id"] == self.LETTERED_ID
+        assert memory.loads == [self.LETTERED_ID]
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def queued_job(n=0, **overrides):
+    return finished_job(
+        id=f"22222222-2222-4222-8222-{n:012d}",
+        status=JobStatus.QUEUED,
+        started_at=None,
+        finished_at=None,
+        result=None,
+        **overrides,
+    )
+
+
+class TestTheTableStaysBounded:
+    """Rows were deleted only when the server started. One that stayed up
+    kept every run, each close to a megabyte, for as long as it did."""
+
+    def test_old_runs_are_pruned_at_most_once_an_hour(self):
+        memory = MemoryRepository()
+        clock = Clock()
+        recorder = RunRecorder(memory, retention=timedelta(days=7), clock=clock)
+        try:
+            # Start-up has just pruned, so not again yet.
+            recorder.record(queued_job(1))
+            clock.now += 3599
+            recorder.record(queued_job(2))
+            recorder.flush()
+            assert memory.pruned == []
+
+            clock.now += 1
+            recorder.record(queued_job(3))
+            recorder.record(queued_job(4))
+            recorder.flush()
+            assert len(memory.pruned) == 1
+            age = datetime.now(UTC) - memory.pruned[0]
+            assert timedelta(days=7) <= age < timedelta(days=7, minutes=1)
+
+            clock.now += 3600
+            recorder.record(queued_job(5))
+            recorder.flush()
+            assert len(memory.pruned) == 2
+        finally:
+            recorder.close()
+
+    def test_only_a_new_run_prompts_it(self):
+        memory = MemoryRepository()
+        clock = Clock()
+        recorder = RunRecorder(memory, retention=timedelta(days=7), clock=clock)
+        clock.now += 7200
+        recorder.record(finished_job())
+        recorder.close()
+        assert len(memory.saves) == 1 and memory.pruned == []
+
+    def test_a_new_run_trims_its_owners_older_ones(self):
+        memory = MemoryRepository()
+        for n in range(3):
+            old = finished_job(id=f"11111111-1111-4111-8111-{n:012d}")
+            memory.rows[old.id] = replace(old, created_at=old.created_at + timedelta(hours=n))
+        theirs = finished_job(id="33333333-3333-4333-8333-333333333333", owner=USER_B)
+        memory.rows[theirs.id] = theirs
+
+        recorder = RunRecorder(memory, max_runs_per_owner=2)
+        new = queued_job(created_at=datetime.now(UTC))
+        recorder.record(new)
+        recorder.close()
+
+        assert memory.trimmed == [(USER_A, 2)]
+        mine = {job.id for job in memory.rows.values() if job.owner == USER_A}
+        assert mine == {new.id, "11111111-1111-4111-8111-000000000002"}
+        assert theirs.id in memory.rows
+
+    def test_nothing_is_tidied_unless_asked(self):
+        memory = MemoryRepository()
+        clock = Clock()
+        recorder = RunRecorder(memory, clock=clock)
+        clock.now += 7200
+        recorder.record(queued_job())
+        recorder.close()
+        assert memory.trimmed == [] and memory.pruned == []
+
+    def test_a_tidy_that_fails_does_not_stop_the_writes(self):
+        class Untidy(MemoryRepository):
+            def trim_owner(self, owner, keep):
+                raise RunStoreError("down")
+
+            def prune(self, older_than):
+                super().prune(older_than)
+                raise RunStoreError("down")
+
+        untidy = Untidy()
+        clock = Clock()
+        recorder = RunRecorder(
+            untidy, retention=timedelta(days=7), max_runs_per_owner=2, clock=clock
+        )
+        clock.now += 3600
+        recorder.record(queued_job(1))
+        recorder.record(queued_job(2))
+        recorder.close()
+        assert len(untidy.saves) == 2
+        # Tried once, then left for an hour rather than retried per run.
+        assert len(untidy.pruned) == 1
+
+    def test_a_run_that_could_not_be_saved_tidies_nothing(self):
+        class Down(MemoryRepository):
+            def save(self, job):
+                raise RunStoreError("down")
+
+        down = Down()
+        recorder = RunRecorder(down, max_runs_per_owner=2)
+        recorder.record(queued_job())
+        recorder.close()
+        assert down.trimmed == []
+
+    def test_the_server_keeps_each_persons_newest_runs(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        memory = MemoryRepository()
+        app = create_app(
+            replace(TEST_SETTINGS, max_stored_runs_per_user=1),
+            authenticator=FakeAuthByUuid(),
+            runs=memory,
+        )
+        with TestClient(app, headers=AS_A) as client:
+            for _ in range(2):
+                poll_url = client.post("/simulations", json={}).json()["poll_url"]
+                poll_until_finished(client, poll_url)
+        # Leaving the block writes everything recorded.
+        assert memory.trimmed == [(USER_A, 1), (USER_A, 1)]
+        assert list(memory.rows) == [poll_url.rsplit("/", 1)[-1]]
+        assert len(memory.pruned) == 1
+
+    def test_zero_keeps_every_run_until_it_ages_out(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        memory = MemoryRepository()
+        app = create_app(
+            replace(TEST_SETTINGS, max_stored_runs_per_user=0),
+            authenticator=FakeAuthByUuid(),
+            runs=memory,
+        )
+        with TestClient(app, headers=AS_A) as client:
+            poll_url = client.post("/simulations", json={}).json()["poll_url"]
+            poll_until_finished(client, poll_url)
+        assert memory.trimmed == []
