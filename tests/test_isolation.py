@@ -49,6 +49,46 @@ def wait_until(predicate, timeout=10.0):
     raise AssertionError(f"condition not met within {timeout}s")
 
 
+class _PatientReceiver:
+    """The parent's end of the pipe, which starts waiting for the result
+    only once ``started()`` says the child is running."""
+
+    def __init__(self, receiver, started):
+        self._receiver = receiver
+        self._started = started
+
+    def poll(self, timeout):
+        wait_until(self._started, timeout=60.0)
+        return self._receiver.poll(timeout)
+
+    def __getattr__(self, name):
+        return getattr(self._receiver, name)
+
+
+@pytest.fixture
+def timeout_counted_from(monkeypatch):
+    """Count ``run_isolated``'s timeout from when the child is running.
+
+    It is counted from when the process is started, and a spawned child
+    takes a second or two to import the app before it runs anything (longer
+    on Windows, or a busy machine). With a short timeout the child was
+    sometimes killed before its first line ran, and the tests below then
+    had nothing to show it had ever been alive. Waiting for the child's own
+    sign of life first leaves them timing the kill, not the spawn.
+    """
+
+    def arrange(started):
+        real_pipe = isolation._CONTEXT.Pipe
+
+        def pipe(duplex=True):
+            receiver, sender = real_pipe(duplex=duplex)
+            return _PatientReceiver(receiver, started), sender
+
+        monkeypatch.setattr(isolation._CONTEXT, "Pipe", pipe)
+
+    return arrange
+
+
 def test_the_result_comes_back_from_another_process():
     result = run_isolated(double, 21, timeout=60)
     assert result["doubled"] == 42
@@ -65,17 +105,26 @@ def test_a_child_that_dies_is_reported_not_waited_on():
         run_isolated(die, 3, timeout=60)
 
 
-def test_a_child_that_overruns_is_killed(tmp_path):
+def test_a_child_that_overruns_is_killed(tmp_path, timeout_counted_from):
     """Regression: an overrunning run was only marked failed. Its thread
     could not be stopped, so it kept a core busy until SWMM finished."""
     beats = tmp_path / "beats"
-    started = time.monotonic()
+    running = []
+
+    def has_started():
+        if beats.exists() and not running:
+            running.append(time.monotonic())
+        return bool(running)
+
+    timeout_counted_from(has_started)
     with pytest.raises(SimulationTimeoutError):
-        run_isolated(heartbeat_forever, str(beats), timeout=3)
-    assert time.monotonic() - started < 15
+        run_isolated(heartbeat_forever, str(beats), timeout=1)
+    # Killed at its limit, give or take the reaping.
+    assert 1 <= time.monotonic() - running[0] < 12
 
     # The child is gone: nothing is still writing.
     size = beats.stat().st_size
+    assert size > 0
     time.sleep(0.3)
     assert beats.stat().st_size == size
     assert not isolation._live
@@ -148,10 +197,17 @@ class TestRunDirectories:
         assert used.parent == Path(tempfile.gettempdir())
         assert not used.exists()
 
-    def test_a_killed_runs_files_are_removed(self, tmp_path):
+    def test_a_killed_runs_files_are_removed(self, tmp_path, timeout_counted_from):
         told = tmp_path / "workdir"
+
+        def has_written():
+            # Once the child has said where it is working, and the file it
+            # put there is there to be removed.
+            return told.exists() and (Path(told.read_text()) / "model.out").is_file()
+
+        timeout_counted_from(has_written)
         with pytest.raises(SimulationTimeoutError):
-            run_isolated(write_then_hang, str(told), timeout=3)
+            run_isolated(write_then_hang, str(told), timeout=1)
         workdir = Path(told.read_text())
         assert workdir.parent.name.startswith("drain-run-")
         assert not workdir.exists() and not workdir.parent.exists()
