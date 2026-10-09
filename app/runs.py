@@ -13,8 +13,9 @@ the run itself matters more than its record.
 
 The same thread keeps the table bounded while the server stays up: each new
 run trims its owner's rows to the newest few, and once an hour runs past
-the retention window are deleted. Start-up used to be the only time
-anything was deleted, so a server that never restarted never cleaned up.
+the retention window are deleted, whether or not anything was written in
+that hour. Start-up used to be the only time anything was deleted, so a
+server that never restarted never cleaned up.
 
 The table is defined in the frontend repository's
 ``supabase/schemas/schema_ops.sql``.
@@ -289,7 +290,9 @@ class RunRecorder:
 
     With ``max_runs_per_owner``, each newly queued run trims its owner's
     rows to that many; with ``retention``, runs older than it are deleted
-    at most once an hour. Both happen on the same thread, after the write.
+    once an hour. Both happen on the same thread. The prune used to wait
+    for a new run to prompt it, so an idle server kept rows past their
+    retention until its next run or restart; the thread now wakes for it.
     """
 
     def __init__(
@@ -300,11 +303,13 @@ class RunRecorder:
         retention: timedelta | None = None,
         max_runs_per_owner: int | None = None,
         clock: Callable[[], float] = time.monotonic,
+        prune_interval: float = PRUNE_INTERVAL_SECONDS,
     ) -> None:
         self._repository = repository
         self._retention = retention
         self._max_runs_per_owner = max_runs_per_owner
         self._clock = clock
+        self._prune_interval = prune_interval
         # Start-up prunes once itself (app.main), so the first prune from
         # here is an hour after that. Only the writer thread reads this.
         self._pruned_at = clock()
@@ -369,9 +374,24 @@ class RunRecorder:
                 self._queue.qsize(),
             )
 
+    def _until_prune(self) -> float | None:
+        """Seconds the writer may sleep before a prune is due, or ``None``
+        if one never is."""
+        if self._retention is None:
+            return None
+        return max(0.0, self._prune_interval - (self._clock() - self._pruned_at))
+
     def _drain(self) -> None:
         while True:
-            item = self._queue.get()
+            # Sleeps until there is something to write or a prune is due,
+            # whichever comes first. A prune stamps the time whether or not
+            # it worked, so the wait after one is a whole interval and this
+            # never spins.
+            try:
+                item = self._queue.get(timeout=self._until_prune())
+            except queue.Empty:
+                self._prune_if_due()
+                continue
             if item is _STOP:
                 return
             if isinstance(item, threading.Event):
@@ -380,21 +400,32 @@ class RunRecorder:
             assert isinstance(item, SimulationJob)
             try:
                 self._repository.save(item)
+            except RunStoreError as error:
+                # One line, no traceback: during an outage every write lands
+                # here. Still an error: this run's record is lost.
+                logger.error("Could not record simulation %s (%s): %s", item.id, item.status, error)
+                continue
             except Exception:
                 logger.exception("Could not record simulation %s (%s)", item.id, item.status)
                 continue
             if item.status is JobStatus.QUEUED:
-                self._tidy(item)
+                self._trim(item)
+            self._prune_if_due()
 
-    def _tidy(self, job: SimulationJob) -> None:
-        """Keep the table bounded, now that ``job`` has added a row to it."""
-        if self._max_runs_per_owner is not None and job.owner is not None:
-            try:
-                self._repository.trim_owner(job.owner, self._max_runs_per_owner)
-            except Exception:
-                logger.exception("Could not trim the stored runs of %s", job.owner)
+    def _trim(self, job: SimulationJob) -> None:
+        """Keep ``job``'s owner to their newest runs, now that it added one."""
+        if self._max_runs_per_owner is None or job.owner is None:
+            return
+        try:
+            self._repository.trim_owner(job.owner, self._max_runs_per_owner)
+        except Exception:
+            logger.exception("Could not trim the stored runs of %s", job.owner)
+
+    def _prune_if_due(self) -> None:
+        """Delete runs past the retention window, if an interval has passed
+        since the last time."""
         now = self._clock()
-        if self._retention is None or now - self._pruned_at < PRUNE_INTERVAL_SECONDS:
+        if self._retention is None or now - self._pruned_at < self._prune_interval:
             return
         # Stamped first, so a table that can't be pruned is tried again in
         # an hour rather than on every run.
