@@ -228,7 +228,7 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
 | `SUPABASE_SERVICE_ROLE_KEY` | unset | Records every run in the `simulation_runs` table so results survive a restart. A secret: set it only in the host's environment |
 | `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
-| `MAX_STORED_RUNS_PER_USER` | `20` | Recorded runs kept per person; a new run deletes their oldest finished ones beyond it (`0` keeps them all until they age out) |
+| `MAX_STORED_RUNS_PER_USER` | `20` | Recorded runs kept per person; a new run deletes their oldest finished ones beyond it (`0` keeps them all until they age out). Must not be lower than `MAX_RUNS_PER_USER_PER_HOUR`, whose count is read from these rows; a lower value is an error at start-up |
 | `REQUIRE_CONFIRMED_EMAIL` | `true` | Refuse accounts without a confirmed email address, anonymous sign-ins included (`403`). Turn off only if the app signs people in by phone |
 | `MAX_JOBS_PER_IP` | `3` | Runs one client address may have queued or running at once, across all its accounts |
 | `SUBMIT_RATE_LIMIT_PER_MINUTE` | `6` | `POST /simulations` requests per minute per client address (`0` turns it off) |
@@ -237,7 +237,7 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_REQUEST_BYTES` | `655360` | Largest request body accepted (`413` above it). The biggest real request, every node and link with every field, is about 495 KB |
 | `ISOLATE_SIMULATIONS` | `true` | Run each simulation in a child process that is killed at `MAX_RUNTIME_SECONDS` |
 | `ENABLE_DOCS` | `false` | Serve `/docs`, `/redoc` and `/openapi.json` |
-| `ALLOW_INSECURE_DEPLOY` | `false` | Start on Render even with `REQUIRE_AUTH` off or `TRUSTED_PROXY_HOPS` at `0`, which otherwise stop the server starting there (see Deployment) |
+| `ALLOW_INSECURE_DEPLOY` | `false` | Start on Render even with settings that otherwise stop the server starting there, such as `REQUIRE_AUTH` off or `TRUSTED_PROXY_HOPS` at `0` (see Deployment for the full list) |
 
 A switch takes `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0`. Anything
 else is an error at start-up rather than a guess.
@@ -332,7 +332,11 @@ with `SUPABASE_SERVICE_ROLE_KEY` set, the hour is counted from the
 counted as their /64 network, since they can send from any address in it.
 The last 2 of the queue's 8 places are kept for accounts that have started
 at most two runs in the past hour, so a few heavy users can't fill it
-against everyone else. Request bodies over 640 KB get `413`.
+against everyone else. Queued runs start by turns, not in the order they
+arrived: a free worker takes the oldest run of the account whose last start
+is furthest back, one with no start in the last 15 minutes
+(`RESULT_RETENTION_SECONDS`) first, so a newcomer doesn't wait behind every
+run the heavy users have queued. Request bodies over 640 KB get `413`.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
   and where to poll. Returns `429` when the caller already has a run going,
@@ -391,8 +395,9 @@ starts and finishes (the table is defined in the frontend repository's
 holds in memory — it expired, or the server restarted — is answered from
 there. On start-up, runs a restart cut short are marked failed with a
 message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted;
-while the server stays up they are deleted once an hour, and each new run
-trims its owner's finished runs to the newest `MAX_STORED_RUNS_PER_USER`.
+while the server stays up they are deleted once an hour, whether or not
+anyone is using it, and each new run trims its owner's finished runs to
+the newest `MAX_STORED_RUNS_PER_USER`.
 Users can read their own runs from the table; nobody but the server can
 write them. Without the key, runs live in memory only and are lost on a
 restart; the server logs a warning at start-up.
@@ -434,10 +439,31 @@ The backend is deployed on Render and serves the production API:
 `Procfile` starts `app.main:app` and binds `$PORT`.
 
 **The server refuses to start on Render** (where `RENDER` is set in the
-environment) unless `TRUSTED_PROXY_HOPS` is at least `1` and `REQUIRE_AUTH`
-is on. It logs what is wrong and exits, so the deploy fails instead of
-serving open or with one rate limit shared by everyone. Setting
-`ALLOW_INSECURE_DEPLOY=true` starts it anyway, with warnings.
+environment) with any of these:
+
+- `REQUIRE_AUTH` off: anyone could run simulations.
+- `TRUSTED_PROXY_HOPS` below `1`: every caller would share one rate limit.
+- `SUPABASE_URL` or `SUPABASE_ANON_KEY` missing while `REQUIRE_AUTH` is on:
+  nobody could be signed in. The server used to start like this, pass its
+  health check, and answer every simulation with `503`.
+- `REQUIRE_CONFIRMED_EMAIL` off: throwaway and anonymous accounts could
+  run simulations.
+- `SUBMIT_RATE_LIMIT_PER_MINUTE` or `POLL_RATE_LIMIT_PER_MINUTE` at `0` or
+  below, which turns that limit off.
+- `MAX_JOBS_PER_USER`, `MAX_RUNS_PER_USER_PER_HOUR` or `MAX_JOBS_PER_IP` at
+  `0` or below. Zero does not lift these caps: nobody is ever under one,
+  so every simulation would be refused with `429`.
+
+It logs what is wrong and exits, so the deploy fails instead of serving
+open, with one rate limit shared by everyone, or up and refusing every
+run. Setting `ALLOW_INSECURE_DEPLOY=true` starts it anyway, with warnings;
+it waives the whole list, so a deployment that needs one of these (sign-in
+by phone, say, with `REQUIRE_CONFIRMED_EMAIL=false`) should check the rest
+by hand.
+
+A missing `SUPABASE_SERVICE_ROLE_KEY` does not stop it. The server works
+without the key, but keeps runs in memory only, and logs a warning saying
+so every time it starts.
 
 Before the first deploy, set:
 
@@ -449,8 +475,12 @@ Before the first deploy, set:
   `--forwarded-allow-ips='*'` takes the leftmost, so it is not used.) If
   another proxy, such as a CDN, sits in front of Render, count it too. The
   server logs a warning if it sees `X-Forwarded-For` while this is `0`.
-- `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`.
-- Leave `REQUIRE_AUTH` unset or `true` (**required**).
+- `SUPABASE_URL` and `SUPABASE_ANON_KEY` (**required**), and
+  `SUPABASE_SERVICE_ROLE_KEY` so runs survive a restart.
+- Leave `REQUIRE_AUTH` and `REQUIRE_CONFIRMED_EMAIL` unset or `true`
+  (**required**).
+- Leave the rate limits and the per-person and per-address caps unset, or
+  at `1` or more (**required**).
 - Leave `ENABLE_DOCS` and `ALLOW_INSECURE_DEPLOY` unset.
 
 ---

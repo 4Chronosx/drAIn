@@ -182,6 +182,20 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        config = cls._read_env()
+        # The hourly allowance is counted from the stored runs so a restart
+        # doesn't reset it. Keeping fewer than an hour's worth deletes the
+        # rows that count relies on.
+        if 0 < config.max_stored_runs_per_user < config.max_runs_per_user_per_hour:
+            raise ValueError(
+                f"MAX_STORED_RUNS_PER_USER ({config.max_stored_runs_per_user}) must be at "
+                f"least MAX_RUNS_PER_USER_PER_HOUR ({config.max_runs_per_user_per_hour}), "
+                "or 0 to keep every run until it ages out."
+            )
+        return config
+
+    @classmethod
+    def _read_env(cls) -> Settings:
         return cls(
             allowed_origins=_env_list("ALLOWED_ORIGINS") or DEFAULT_ALLOWED_ORIGINS,
             origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX", DEFAULT_ORIGIN_REGEX),
@@ -219,6 +233,13 @@ def deployment_problems(config: Settings, environ: Mapping[str, str]) -> list[st
     and served, open or with every caller sharing one rate limit. Render
     sets ``RENDER`` in every service's environment; anywhere else there is
     nothing to check against, and this is empty.
+
+    It also covers settings that leave the server up and useless: it
+    started, passed its health check, and refused every simulation.
+
+    A missing ``SUPABASE_SERVICE_ROLE_KEY`` is not one. The server works
+    without it, keeping runs in memory only, and warns of that when it
+    is built (app.main).
     """
     if not environ.get("RENDER", "").strip():
         return []
@@ -230,6 +251,41 @@ def deployment_problems(config: Settings, environ: Mapping[str, str]) -> list[st
             "TRUSTED_PROXY_HOPS is 0, so every caller is seen as Render's proxy and "
             "they all share one rate limit. Set it to 1."
         )
+    if config.require_auth:
+        missing = [
+            name
+            for name, value in (
+                ("SUPABASE_URL", config.supabase_url),
+                ("SUPABASE_ANON_KEY", config.supabase_anon_key),
+            )
+            if not value
+        ]
+        if missing:
+            problems.append(
+                f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set, "
+                "so nobody can be signed in and every simulation is refused."
+            )
+    if not config.require_confirmed_email:
+        problems.append(
+            "REQUIRE_CONFIRMED_EMAIL is off, so throwaway and anonymous accounts can "
+            "run simulations."
+        )
+    # A rate limit of 0 is off (app.middleware).
+    for name, per_minute in (
+        ("SUBMIT_RATE_LIMIT_PER_MINUTE", config.submit_rate_per_minute),
+        ("POLL_RATE_LIMIT_PER_MINUTE", config.poll_rate_per_minute),
+    ):
+        if per_minute < 1:
+            problems.append(f"{name} is {per_minute}, which turns that rate limit off.")
+    # A cap of 0 is not off: nobody is ever under it, so every run is
+    # refused (app.jobs).
+    for name, cap in (
+        ("MAX_JOBS_PER_USER", config.max_jobs_per_user),
+        ("MAX_RUNS_PER_USER_PER_HOUR", config.max_runs_per_user_per_hour),
+        ("MAX_JOBS_PER_IP", config.max_jobs_per_ip),
+    ):
+        if cap < 1:
+            problems.append(f"{name} is {cap}, so every simulation is refused.")
     return problems
 
 

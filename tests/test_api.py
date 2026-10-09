@@ -787,24 +787,77 @@ def test_production_hostnames_may_by_default(client, origin):
 #: Render sets this in the environment of every service it runs.
 ON_RENDER = {"RENDER": "true"}
 
+#: What a deployment sets, over the tests' own settings (which turn the
+#: rate limits off).
+DEPLOYED = {
+    "trusted_proxy_hops": 1,
+    "supabase_url": "https://p.supabase.co",
+    "supabase_anon_key": "anon-key",
+    "supabase_service_role_key": None,
+    "require_confirmed_email": True,
+    "submit_rate_per_minute": 6,
+    "poll_rate_per_minute": 120,
+}
+
 
 class TestDeploymentGuard:
     """Settings that suit a laptop reached the deployed server and it
     started anyway: open to anyone, or with every caller sharing the
     proxy's rate limit. On Render it now refuses to start."""
 
+    def deployed(self, environ=ON_RENDER, **overrides):
+        return make_app(environ=environ, **{**DEPLOYED, **overrides})
+
     def test_a_deployment_without_sign_in_does_not_start(self):
-        app = make_app(environ=ON_RENDER, require_auth=False, trusted_proxy_hops=1)
+        app = self.deployed(require_auth=False)
         with pytest.raises(RuntimeError, match="REQUIRE_AUTH"), TestClient(app):
             pass
 
     def test_a_deployment_that_cannot_tell_callers_apart_does_not_start(self):
-        app = make_app(environ=ON_RENDER, trusted_proxy_hops=0)
+        app = self.deployed(trusted_proxy_hops=0)
         with pytest.raises(RuntimeError, match="TRUSTED_PROXY_HOPS"), TestClient(app):
             pass
 
+    @pytest.mark.parametrize("missing", ["supabase_url", "supabase_anon_key"])
+    def test_a_deployment_that_cannot_sign_anyone_in_does_not_start(self, missing):
+        """Regression: it started, passed its health check, and answered
+        every simulation with 503."""
+        app = self.deployed(**{missing: None})
+        with pytest.raises(RuntimeError, match=missing.upper()), TestClient(app):
+            pass
+
+    def test_a_deployment_open_to_unconfirmed_accounts_does_not_start(self):
+        app = self.deployed(require_confirmed_email=False)
+        with pytest.raises(RuntimeError, match="REQUIRE_CONFIRMED_EMAIL"), TestClient(app):
+            pass
+
+    @pytest.mark.parametrize(
+        ("setting", "variable"),
+        [
+            ("submit_rate_per_minute", "SUBMIT_RATE_LIMIT_PER_MINUTE"),
+            ("poll_rate_per_minute", "POLL_RATE_LIMIT_PER_MINUTE"),
+            ("max_jobs_per_user", "MAX_JOBS_PER_USER"),
+            ("max_runs_per_user_per_hour", "MAX_RUNS_PER_USER_PER_HOUR"),
+            ("max_jobs_per_ip", "MAX_JOBS_PER_IP"),
+        ],
+    )
+    def test_a_deployment_with_a_limit_at_zero_does_not_start(self, setting, variable):
+        app = self.deployed(**{setting: 0})
+        with pytest.raises(RuntimeError, match=variable), TestClient(app):
+            pass
+
     def test_a_sound_deployment_starts(self):
-        app = make_app(environ=ON_RENDER, trusted_proxy_hops=1)
+        with TestClient(self.deployed()) as deployed:
+            assert deployed.get("/health").status_code == 200
+
+    def test_a_deployment_that_keeps_runs_in_memory_starts_with_a_warning(self, caplog):
+        # Built from the settings alone, as the server is. No service-role
+        # key: it works, but forgets its runs when it restarts.
+        config = replace(TEST_SETTINGS, **DEPLOYED)
+        with caplog.at_level(logging.WARNING, logger="app.main"):
+            app = create_app(config, environ=ON_RENDER)
+        warned = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert any("SUPABASE_SERVICE_ROLE_KEY" in record.getMessage() for record in warned)
         with TestClient(app) as deployed:
             assert deployed.get("/health").status_code == 200
 
@@ -815,14 +868,14 @@ class TestDeploymentGuard:
 
     def test_the_override_starts_it_anyway(self):
         environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": "true"}
-        app = make_app(environ=environ, trusted_proxy_hops=0)
+        app = self.deployed(environ, trusted_proxy_hops=0, require_confirmed_email=False)
         with TestClient(app) as deployed:
             assert deployed.get("/health").status_code == 200
 
     @pytest.mark.parametrize("value", ["false", "0", ""])
     def test_an_override_that_is_off_does_not(self, value):
         environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": value}
-        app = make_app(environ=environ, trusted_proxy_hops=0)
+        app = self.deployed(environ, trusted_proxy_hops=0)
         with pytest.raises(RuntimeError, match="Refusing to start"), TestClient(app):
             pass
 
@@ -831,14 +884,14 @@ class TestDeploymentGuard:
         monkeypatch.setattr(
             "app.main.logger.log", lambda level, message, *args: logged.append((level, args[0]))
         )
-        app = make_app(environ=ON_RENDER, require_auth=False, trusted_proxy_hops=0)
+        app = self.deployed(require_auth=False, trusted_proxy_hops=0)
         with pytest.raises(RuntimeError), TestClient(app):
             pass
         assert [level for level, _ in logged] == [logging.ERROR, logging.ERROR]
 
         logged.clear()
         environ = {**ON_RENDER, "ALLOW_INSECURE_DEPLOY": "yes"}
-        app = make_app(environ=environ, require_auth=False, trusted_proxy_hops=0)
+        app = self.deployed(environ, require_auth=False, trusted_proxy_hops=0)
         with TestClient(app):
             pass
         assert [level for level, _ in logged] == [logging.WARNING, logging.WARNING]

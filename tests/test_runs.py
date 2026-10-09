@@ -260,6 +260,35 @@ class TestRunRecorder:
         recorder.close()
         assert len(flaky.saves) == 2
 
+    def test_a_write_supabase_refused_is_logged_as_one_line(self, caplog):
+        # Every write during an outage lands here; a traceback for each
+        # buried everything else in the log.
+        class Down(MemoryRepository):
+            def save(self, job):
+                raise RunStoreError("Could not reach Supabase: timed out")
+
+        recorder = RunRecorder(Down())
+        job = finished_job()
+        with caplog.at_level(logging.ERROR, logger="app.runs"):
+            recorder.record(job)
+            recorder.close()
+        (record,) = caplog.records
+        assert record.levelno == logging.ERROR
+        assert job.id in record.getMessage() and "timed out" in record.getMessage()
+        assert record.exc_info is None
+
+    def test_a_write_that_fails_some_other_way_keeps_its_traceback(self, caplog):
+        class Broken(MemoryRepository):
+            def save(self, job):
+                raise TypeError("not a Supabase outage")
+
+        recorder = RunRecorder(Broken())
+        with caplog.at_level(logging.ERROR, logger="app.runs"):
+            recorder.record(finished_job())
+            recorder.close()
+        (record,) = caplog.records
+        assert record.exc_info is not None
+
 
 class TestRunRecorderShutdown:
     class Slow(MemoryRepository):
@@ -356,6 +385,29 @@ class TestRunsSurviveRestarts:
             pass
         assert memory.failed_unfinished == [RESTARTED_MESSAGE]
         assert len(memory.pruned) == 1
+
+    def test_startup_still_prunes_if_it_could_not_fail_the_unfinished(self):
+        """Regression: the two shared one ``try``, so the first failing
+        skipped the second."""
+
+        class Unpatchable(MemoryRepository):
+            def fail_unfinished(self, reason):
+                raise RunStoreError("down")
+
+        memory = Unpatchable()
+        with TestClient(self.make_app(memory)) as client:
+            assert client.get("/health").status_code == 200
+        assert len(memory.pruned) == 1
+
+    def test_startup_survives_a_prune_that_fails(self):
+        class Unprunable(MemoryRepository):
+            def prune(self, older_than):
+                raise RunStoreError("down")
+
+        memory = Unprunable()
+        with TestClient(self.make_app(memory)) as client:
+            assert client.get("/health").status_code == 200
+        assert memory.failed_unfinished == [RESTARTED_MESSAGE]
 
     def test_a_result_gone_from_memory_is_read_back(self):
         memory = MemoryRepository()
@@ -527,6 +579,33 @@ class TestUnknownRunsAreRemembered:
         assert rendered == []
 
 
+class TestTheRunTableIsDown:
+    class Unreadable(MemoryRepository):
+        def load(self, job_id):
+            raise RunStoreError("Could not reach Supabase: timed out")
+
+    def test_a_poll_for_a_run_not_in_memory_is_a_404(self):
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=self.Unreadable())
+        with TestClient(app, headers=AS_A) as client:
+            assert client.get(f"/simulations/{JOB_ID}").status_code == 404
+
+    def test_each_such_poll_is_logged_as_one_line(self, caplog):
+        # Every poll for a run not in memory lands here during an outage; a
+        # traceback for each buried everything else in the log.
+        app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=self.Unreadable())
+        with TestClient(app, headers=AS_A) as client:
+            # Start-up reconfigures logging, so listen only once it has.
+            logging.getLogger("app.main").addHandler(caplog.handler)
+            try:
+                client.get(f"/simulations/{JOB_ID}")
+            finally:
+                logging.getLogger("app.main").removeHandler(caplog.handler)
+        records = [record for record in caplog.records if JOB_ID in record.getMessage()]
+        assert [record.levelno for record in records] == [logging.WARNING]
+        assert "timed out" in records[0].getMessage()
+        assert records[0].exc_info is None
+
+
 class TestJobIdsAreChecked:
     """The id in a poll's path is the caller's to write. Only the form the
     job store issues is looked up; ``uuid.UUID`` also takes braces, a urn
@@ -632,14 +711,76 @@ class TestTheTableStaysBounded:
         finally:
             recorder.close()
 
-    def test_only_a_new_run_prompts_it(self):
+    def test_any_write_prompts_it_once_it_is_due(self):
         memory = MemoryRepository()
         clock = Clock()
         recorder = RunRecorder(memory, retention=timedelta(days=7), clock=clock)
         clock.now += 7200
         recorder.record(finished_job())
         recorder.close()
-        assert len(memory.saves) == 1 and memory.pruned == []
+        assert len(memory.saves) == 1 and len(memory.pruned) == 1
+
+    def test_an_idle_server_still_prunes(self):
+        """Regression: only a new run prompted a prune, so a server nobody
+        was using kept rows past their retention until its next run or
+        restart."""
+        memory = MemoryRepository()
+        started = time.monotonic()
+        recorder = RunRecorder(memory, retention=timedelta(days=7), prune_interval=0.05)
+        try:
+            deadline = started + 5
+            while len(memory.pruned) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            pruned, elapsed = len(memory.pruned), time.monotonic() - started
+            assert pruned >= 3
+            # Woken by the clock, not spinning: never more than one an interval.
+            assert pruned <= elapsed / 0.05
+            assert memory.saves == []
+            age = datetime.now(UTC) - memory.pruned[0]
+            assert timedelta(days=7) <= age < timedelta(days=7, minutes=1)
+        finally:
+            recorder.close()
+
+    def test_an_idle_prune_that_fails_waits_an_interval_too(self):
+        class Unprunable(MemoryRepository):
+            def prune(self, older_than):
+                super().prune(older_than)
+                raise RunStoreError("down")
+
+        unprunable = Unprunable()
+        started = time.monotonic()
+        recorder = RunRecorder(unprunable, retention=timedelta(days=7), prune_interval=0.05)
+        try:
+            deadline = started + 5
+            while len(unprunable.pruned) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            pruned, elapsed = len(unprunable.pruned), time.monotonic() - started
+            assert 2 <= pruned <= elapsed / 0.05
+            # And the thread is still there to write.
+            recorder.record(finished_job())
+            recorder.flush()
+            assert len(unprunable.saves) == 1
+        finally:
+            recorder.close()
+
+    def test_nothing_wakes_it_when_there_is_nothing_to_prune(self):
+        recorder = RunRecorder(MemoryRepository(), prune_interval=0.01)
+        try:
+            assert recorder._until_prune() is None
+        finally:
+            recorder.close()
+
+    def test_waiting_for_the_next_prune_does_not_hold_up_shutdown(self):
+        memory = MemoryRepository()
+        recorder = RunRecorder(memory, retention=timedelta(days=7))
+        recorder.record(finished_job())
+        recorder.flush()
+        # Now asleep until the next prune, an hour off.
+        started = time.monotonic()
+        recorder.close()
+        assert time.monotonic() - started < 1
+        assert not recorder._thread.is_alive()
+        assert memory.pruned == []
 
     def test_a_new_run_trims_its_owners_older_ones(self):
         memory = MemoryRepository()
