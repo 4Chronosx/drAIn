@@ -11,13 +11,14 @@ of the job. See the note in the README before scaling out.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import re
 import threading
 import uuid
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -104,7 +105,10 @@ class _Entry:
     #: The simulation to run. Dropped once the job starts or finishes, so a
     #: finished job does not keep its request alive.
     work: Callable[[], dict[str, Any]] | None
-    future: Future[None] | None = None
+    #: Its place in the order jobs were started in, once it has started.
+    #: A count rather than ``started_at``: two starts can share a tick of
+    #: a coarse clock, and who started last decides who goes next.
+    turn: int | None = None
 
 
 class JobStore:
@@ -129,8 +133,17 @@ class JobStore:
     The last ``reserved_slots`` places in the queue are kept for owners who
     have started at most :data:`LIGHT_USE_RUNS` runs in the past hour. The
     hourly allowance alone let a handful of accounts, each within it, hold
-    every place; this leaves room for someone running their first. Order in
-    the queue is unchanged: it decides who gets in, not who goes first.
+    every place; this leaves room for someone running their first.
+
+    That decides who gets in. Who goes first is by turns: a free worker
+    takes the oldest queued job of the owner whose last start is furthest
+    back, an owner with none on record before any other. Jobs used to start
+    in the order they arrived, so someone let into a reserved place still
+    waited behind every run the heavy users had queued. One owner's jobs
+    still start in the order they arrived, as do jobs between owners who
+    are level. "On record" is the jobs the store still holds, so a start is
+    forgotten with its result, ``retention`` after it finished. Work without
+    an owner takes turns as if it all had the same one.
     """
 
     def __init__(
@@ -154,7 +167,9 @@ class JobStore:
         self._retention = retention
         self._max_runtime = max_runtime
         self._max_queue_wait = max_queue_wait
+        # In the order they were queued, which is what "oldest" means below.
         self._entries: dict[str, _Entry] = {}
+        self._turns = itertools.count(1)
         # One slow user shouldn't be able to fill the queue for everyone.
         self._max_jobs_per_owner = max_jobs_per_owner
         self._max_runs_per_owner_per_hour = max_runs_per_owner_per_hour
@@ -269,7 +284,7 @@ class JobStore:
             accepted = replace(entry.job)
             # Before dispatch, so "queued" is reported before "running".
             self._notify(entry.job)
-            self._dispatch(entry)
+            self._dispatch()
 
         logger.info("Queued simulation %s", entry.job.id)
         return entry, accepted
@@ -335,18 +350,46 @@ class JobStore:
         except Exception:
             logger.exception("Job listener failed for simulation %s", job.id)
 
-    def _dispatch(self, entry: _Entry) -> None:
-        """Hand a queued job to the current pool. Caller holds the lock."""
-        entry.future = self._executor.submit(self._run, entry)
+    def _dispatch(self) -> None:
+        """Ask the current pool to start one more job. Caller holds the lock.
 
-    def _run(self, entry: _Entry) -> None:
-        job = entry.job
+        Called once per queued job, but the request is for a worker, not
+        for that job: the worker starts whichever job is next when it gets
+        there (:meth:`_next_queued`).
+        """
+        self._executor.submit(self._run_next)
+
+    def _next_queued(self) -> _Entry | None:
+        """The queued job to start next, or ``None``. Caller holds the lock.
+
+        The oldest job of the owner whose last start is furthest back, an
+        owner with none on record first. ``min`` keeps the first of equals
+        and the entries are in the order they were queued, so equals go in
+        that order.
+        """
+        last_turn: dict[str | None, int] = {}
+        for entry in self._entries.values():
+            if entry.turn is not None:
+                owner = entry.job.owner
+                last_turn[owner] = max(entry.turn, last_turn.get(owner, 0))
+        queued = (
+            entry
+            for entry in self._entries.values()
+            if entry.job.status is JobStatus.QUEUED and entry.work is not None
+        )
+        return min(queued, key=lambda entry: last_turn.get(entry.job.owner, 0), default=None)
+
+    def _run_next(self) -> None:
         with self._lock:
-            # A job that timed out in the queue, or was failed by shutdown,
-            # must not run once a worker finally reaches it.
-            if job.status is not JobStatus.QUEUED or entry.work is None:
+            # None when a job timed out in the queue or was failed by
+            # shutdown: the worker asked for on its behalf finds one fewer
+            # to start, and such a job must not run.
+            entry = self._next_queued()
+            if entry is None:
                 return
+            job = entry.job
             work, entry.work = entry.work, None
+            entry.turn = next(self._turns)
             job.status = JobStatus.RUNNING
             job.started_at = _now()
             self._notify(job)
@@ -404,9 +447,6 @@ class JobStore:
         job.error = error
         entry.work = None
         self._notify(job)
-        if entry.future is not None:
-            # Only takes effect while the job is still waiting for a worker.
-            entry.future.cancel()
         return True
 
     def _drop_expired(self) -> None:
@@ -470,21 +510,19 @@ class JobStore:
         """Move queued work to a fresh pool. Caller holds the lock.
 
         The abandoned thread still occupies a worker in the old pool, and
-        would keep every job queued there from ever starting. A job the old
-        pool has already begun cannot be cancelled and is left to run there.
+        would keep every job queued there from ever starting. The old pool's
+        requests for a worker are cancelled, or its workers would start jobs
+        beside the new pool's once the thread let go. A job the old pool has
+        already begun cannot be cancelled and is left to run there.
         """
         old = self._executor
         self._executor = self._new_executor()
         moved = 0
         for entry in self._entries.values():
-            if (
-                entry.job.status is JobStatus.QUEUED
-                and entry.future is not None
-                and entry.future.cancel()
-            ):
-                self._dispatch(entry)
+            if entry.job.status is JobStatus.QUEUED:
+                self._dispatch()
                 moved += 1
-        old.shutdown(wait=False)
+        old.shutdown(wait=False, cancel_futures=True)
         logger.warning(
             "Replaced the simulation pool after a run was abandoned; moved %d queued job(s)",
             moved,
