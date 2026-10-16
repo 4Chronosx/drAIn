@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import threading
 import time
 
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from app.auth import (
     AccountRefusedError,
@@ -52,19 +53,30 @@ def unsigned(header=None, **claim_overrides) -> str:
 
 
 class SigningKey:
-    """An ES256 key pair, published the way Supabase publishes its keys."""
+    """A key pair (ES256, or RS256 if asked), published the way Supabase
+    publishes its keys."""
 
-    def __init__(self, kid="key-1"):
+    def __init__(self, kid="key-1", algorithm="ES256"):
         self.kid = kid
-        self.private = ec.generate_private_key(ec.SECP256R1())
+        self.algorithm = algorithm
+        if algorithm == "RS256":
+            self.private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        else:
+            self.private = ec.generate_private_key(ec.SECP256R1())
 
     def jwk(self):
-        public = json.loads(jwt.algorithms.ECAlgorithm.to_jwk(self.private.public_key()))
-        return {**public, "kid": self.kid, "alg": "ES256", "use": "sig"}
+        to_jwk = (
+            jwt.algorithms.RSAAlgorithm if self.algorithm == "RS256" else jwt.algorithms.ECAlgorithm
+        ).to_jwk
+        public = json.loads(to_jwk(self.private.public_key()))
+        return {**public, "kid": self.kid, "alg": self.algorithm, "use": "sig"}
 
     def sign(self, **claim_overrides) -> str:
         return jwt.encode(
-            claims(**claim_overrides), self.private, algorithm="ES256", headers={"kid": self.kid}
+            claims(**claim_overrides),
+            self.private,
+            algorithm=self.algorithm,
+            headers={"kid": self.kid},
         )
 
 
@@ -307,6 +319,22 @@ class TestSignatureCheckedLocally:
         assert auth.authenticate(forger.sign()) is None
         assert fake.calls == []
 
+    def test_an_rs256_key_is_checked_the_same_way(self):
+        published = SigningKey(algorithm="RS256")
+        forger = SigningKey(algorithm="RS256")
+        fake = FakeSupabase(keys=[published])
+        auth = authenticator(fake)
+        assert auth.authenticate(forger.sign()) is None
+        assert fake.calls == []
+        assert auth.authenticate(published.sign()) == Caller("user-1")
+        assert len(fake.calls) == 1
+
+    def test_a_token_naming_a_key_under_another_algorithm_is_refused(self):
+        # The key id is the project's, but that key is an RS256 one.
+        fake = FakeSupabase(keys=[SigningKey(algorithm="RS256")])
+        assert authenticator(fake).authenticate(SigningKey().sign()) is None
+        assert fake.calls == []
+
     def test_a_token_naming_an_unpublished_key_is_refused(self):
         fake = FakeSupabase(keys=[SigningKey("key-1")])
         auth = authenticator(fake)
@@ -350,28 +378,151 @@ class TestSignatureCheckedLocally:
 
 
 class TestSharedSecretTokens:
-    """A project that publishes asymmetric keys signs with them. A token
-    saying HS256 is then one somebody wrote, and each used to be sent to
-    Supabase to be turned down."""
+    """A project that has moved to asymmetric keys signs with them. A token
+    saying HS256 is then one somebody wrote, and each is sent to Supabase
+    to be turned down unless ``refuse_hs256`` says the move is over.
 
-    def test_an_hs256_token_is_refused_once_keys_are_published(self):
+    Regression: they were refused as soon as a key was published. Supabase
+    lists a new key before it signs with it, and sessions signed with the
+    shared secret outlive the change, so everyone signed in was turned
+    away."""
+
+    def test_an_hs256_token_is_still_asked_about_once_keys_are_published(self):
         fake = FakeSupabase(keys=[SigningKey()])
         auth = authenticator(fake)
+        token = unsigned()
+        assert auth.authenticate(token) == Caller("user-1")
+        assert len(fake.calls) == 1
+        assert fake.jwks_calls == 1
+
+    def test_it_is_refused_without_asking_once_the_setting_is_on(self):
+        fake = FakeSupabase(keys=[SigningKey()])
+        auth = authenticator(fake, refuse_hs256=True)
         token = unsigned()
         assert auth.authenticate(token) is None
         assert auth.authenticate(token) is None
         assert fake.calls == []
         assert fake.jwks_calls == 1
 
-    def test_it_is_still_asked_about_while_the_project_publishes_no_keys(self):
+    @pytest.mark.parametrize("refuse_hs256", [False, True])
+    def test_it_is_still_asked_about_while_the_project_publishes_no_keys(self, refuse_hs256):
+        # Whatever the setting: HS256 is then the only kind of token there is.
         fake = FakeSupabase(keys=[])
-        assert authenticator(fake).authenticate(unsigned()) == Caller("user-1")
+        auth = authenticator(fake, refuse_hs256=refuse_hs256)
+        assert auth.authenticate(unsigned()) == Caller("user-1")
         assert len(fake.calls) == 1
 
-    def test_it_is_still_asked_about_while_the_keys_cannot_be_fetched(self):
+    @pytest.mark.parametrize("refuse_hs256", [False, True])
+    def test_it_is_still_asked_about_while_the_keys_cannot_be_fetched(self, refuse_hs256):
+        # Whatever the setting: an outage must not sign everyone out.
         fake = FakeSupabase(keys=[SigningKey()], jwks_status=503)
-        assert authenticator(fake).authenticate(unsigned()) == Caller("user-1")
+        auth = authenticator(fake, refuse_hs256=refuse_hs256)
+        assert auth.authenticate(unsigned()) == Caller("user-1")
         assert len(fake.calls) == 1
+
+
+class TestMovingToAsymmetricKeys:
+    """A project on the shared secret publishes no keys, then lists one,
+    then signs with it, while the sessions it signed before live on."""
+
+    def test_nobody_is_signed_out_along_the_way(self):
+        key = SigningKey()
+        fake = FakeSupabase(keys=[])
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        assert auth.authenticate(unsigned(jti="before")) == Caller("user-1")
+
+        # The key is listed, but tokens are still signed with the secret.
+        fake.keys = [key]
+        clock.now += 601
+        assert auth.authenticate(unsigned(jti="listed")) == Caller("user-1")
+
+        # New tokens are signed with the key; older sessions have not expired.
+        assert auth.authenticate(key.sign()) == Caller("user-1")
+        assert auth.authenticate(unsigned(jti="older")) == Caller("user-1")
+        assert len(fake.calls) == 4
+
+    def test_the_first_token_signed_with_a_key_fetches_the_keys_again(self):
+        """Regression: with no keys held, a token naming one prompted no
+        refetch. For up to ten minutes its signature went unchecked and
+        every such token, forged or not, was a call to Supabase."""
+        key = SigningKey()
+        fake = FakeSupabase(keys=[])
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        auth.authenticate(unsigned())
+        assert fake.jwks_calls == 1
+
+        fake.keys = [key]
+        clock.now += 61
+        assert auth.authenticate(key.sign()) == Caller("user-1")
+        assert fake.jwks_calls == 2
+
+        # Checked here from now on: a forgery is not sent to Supabase.
+        assert auth.authenticate(SigningKey().sign()) is None
+        assert len(fake.calls) == 2
+
+    def test_unknown_keys_do_not_each_refetch_while_none_are_held(self):
+        fake = FakeSupabase(keys=[], status=401, body=b"{}")
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        for n in range(5):
+            auth.authenticate(SigningKey(f"stranger-{n}").sign())
+        assert fake.jwks_calls == 1
+
+        clock.now += 61
+        for n in range(5, 10):
+            auth.authenticate(SigningKey(f"stranger-{n}").sign())
+        assert fake.jwks_calls == 2
+
+    def test_nor_while_the_keys_cannot_be_fetched(self):
+        fake = FakeSupabase(keys=[SigningKey()], jwks_status=503, status=401, body=b"{}")
+        auth = authenticator(fake)
+        for n in range(5):
+            auth.authenticate(SigningKey(f"stranger-{n}").sign())
+        assert fake.jwks_calls == 1
+
+
+def hs256_warnings(caplog):
+    return [record for record in caplog.records if "REFUSE_HS256_TOKENS" in record.getMessage()]
+
+
+class TestWarningThatHs256IsStillAccepted:
+    """Once the keys are published, leaving ``refuse_hs256`` off sends every
+    forged HS256 token to Supabase. Nothing said so."""
+
+    def test_it_is_logged_once_when_the_keys_first_appear(self, caplog):
+        key = SigningKey()
+        fake = FakeSupabase(keys=[])
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        with caplog.at_level(logging.WARNING, logger="app.auth"):
+            auth.authenticate(unsigned(jti="before"))
+            assert hs256_warnings(caplog) == []
+
+            fake.keys = [key]
+            for n in range(3):
+                # Each of these fetches the keys again.
+                clock.now += 601
+                auth.authenticate(unsigned(jti=str(n)))
+                auth.authenticate(key.sign(jti=str(n)))
+        assert fake.jwks_calls == 4
+        (warning,) = hs256_warnings(caplog)
+        assert warning.levelno == logging.WARNING
+
+    def test_it_is_not_logged_once_the_setting_is_on(self, caplog):
+        key = SigningKey()
+        auth = authenticator(FakeSupabase(keys=[key]), refuse_hs256=True)
+        with caplog.at_level(logging.WARNING, logger="app.auth"):
+            auth.authenticate(unsigned())
+            auth.authenticate(key.sign())
+        assert hs256_warnings(caplog) == []
+
+    def test_it_is_not_logged_while_the_keys_cannot_be_fetched(self, caplog):
+        auth = authenticator(FakeSupabase(keys=[SigningKey()], jwks_status=503))
+        with caplog.at_level(logging.WARNING, logger="app.auth"):
+            auth.authenticate(unsigned())
+        assert hs256_warnings(caplog) == []
 
 
 class TestRefusalsAreCachedApart:
@@ -458,12 +609,13 @@ class TestRefreshingThePublishedKeys:
         key = SigningKey()
         fake = FakeSupabase(keys=[key])
         clock = Clock()
-        auth = authenticator(fake, clock)
+        auth = authenticator(fake, clock, refuse_hs256=True)
         auth.authenticate(key.sign())
 
         fake.jwks_status = 503
         clock.now += 601
         assert auth.authenticate(SigningKey().sign()) is None
+        # Still known to be published, so still refused here.
         assert auth.authenticate(unsigned()) is None
         assert fake.jwks_calls == 2
         assert len(fake.calls) == 1

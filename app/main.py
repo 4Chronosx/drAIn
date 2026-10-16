@@ -117,6 +117,7 @@ def _build_authenticator(config: Settings) -> Authenticator | None:
             config.supabase_url,
             config.supabase_anon_key,
             require_confirmed_email=config.require_confirmed_email,
+            refuse_hs256=config.refuse_hs256_tokens,
         )
     logger.error(
         "SUPABASE_URL and SUPABASE_ANON_KEY are not set, so nobody can be signed in; "

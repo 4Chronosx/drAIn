@@ -15,14 +15,22 @@ A token goes through up to three checks, cheapest first:
 2. **Its signature, locally,** for tokens signed with an asymmetric key
    (ES256, RS256), against the project's published keys (JWKS). A forged
    token is refused here, without a network call. So is every HS256 token
-   once the project is known to publish keys: it signs with those, and a
-   token claiming the shared secret is one somebody wrote.
+   once ``refuse_hs256`` is set and the project is known to publish keys:
+   it signs with those by then, and a token claiming the shared secret is
+   one somebody wrote.
 3. **Supabase Auth** (``GET /auth/v1/user``) for every token still
    standing: a genuine signature says who signed in, but only Supabase
    knows whether that session has since been signed out. Tokens signed
-   with the shared secret (HS256) by a project that publishes no keys, or
-   any token while the published keys can't be fetched, rely on this check
+   with the shared secret (HS256), unless check 2 refused them, and any
+   token while the published keys can't be fetched, rely on this check
    alone.
+
+**Moving a project to asymmetric keys.** Supabase lists the new key before
+it signs with it, and the sessions signed with the shared secret stay valid
+until they expire. HS256 tokens used to be refused as soon as a key was
+listed, which would have signed everyone out of this service part-way
+through. So they are refused only once ``refuse_hs256`` says the move is
+over; until then a warning, logged once, says the keys have been seen.
 
 Answers are kept briefly -- a client polls every few seconds while it waits
 for a run -- in two bounded caches, so that refused tokens can't crowd out
@@ -82,7 +90,8 @@ MAX_CACHED = 10_000
 MAX_CONCURRENT_CHECKS = 8
 
 #: The published keys are refetched this often, and a token naming a key
-#: they don't have may prompt a refetch no more often than the second.
+#: they don't have (or any key at all, while none are held) may prompt a
+#: refetch no more often than the second.
 JWKS_REFRESH_SECONDS = 600.0
 JWKS_RETRY_SECONDS = 60.0
 
@@ -187,11 +196,20 @@ _VALID, _INVALID, _UNKNOWN = "valid", "invalid", "unknown"
 class _PublishedKeys:
     """The project's public signing keys (JWKS), fetched rarely."""
 
-    def __init__(self, url: str, api_key: str, fetch: Fetch, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        url: str,
+        api_key: str,
+        fetch: Fetch,
+        clock: Callable[[], float],
+        on_published: Callable[[], None] | None = None,
+    ) -> None:
         self._url = url
         self._api_key = api_key
         self._fetch = fetch
         self._clock = clock
+        # Called once, the first time a fetch lists a key.
+        self._on_published = on_published
         self._keys: dict[str, jwt.PyJWK] | None = None
         self._fetched_at = float("-inf")
         self._attempted_at = float("-inf")
@@ -219,7 +237,12 @@ class _PublishedKeys:
         with self._lock:
             now = self._clock()
             stale = now - self._fetched_at > JWKS_REFRESH_SECONDS
-            missing = kid is not None and self._keys is not None and kid not in self._keys
+            # With no keys held, any key a token names is one to look for.
+            # Just after a project starts signing with its first key, its
+            # tokens otherwise stayed unknown, each one a call to Supabase,
+            # until the ten minutes were up. The retry gate bounds this
+            # too, so made-up key ids can't each cost a fetch.
+            missing = kid is not None and (self._keys is None or kid not in self._keys)
             due = (stale or missing) and now - self._attempted_at > JWKS_RETRY_SECONDS
             if not due:
                 return self._keys
@@ -230,7 +253,13 @@ class _PublishedKeys:
             if fetched:
                 self._keys = keys
                 self._fetched_at = now
-            return self._keys
+            held = self._keys
+            announce = self._on_published if held is not None else None
+            if announce is not None:
+                self._on_published = None
+        if announce is not None:
+            announce()
+        return held
 
     def _fetch_keys(self) -> tuple[bool, dict[str, jwt.PyJWK] | None]:
         """(whether the fetch worked, the keys it listed). A failure leaves
@@ -261,6 +290,14 @@ class _PublishedKeys:
         return True, keys or None
 
 
+def _warn_hs256_still_accepted() -> None:
+    logger.warning(
+        "The project publishes asymmetric signing keys, and tokens signed with the "
+        "shared secret (HS256) are still accepted. Set REFUSE_HS256_TOKENS=true once "
+        "the sessions signed with it have expired."
+    )
+
+
 class SupabaseAuthenticator:
     """Checks access tokens for one Supabase project, caching answers briefly."""
 
@@ -273,6 +310,7 @@ class SupabaseAuthenticator:
         clock: Callable[[], float] = time.monotonic,
         *,
         require_confirmed_email: bool = True,
+        refuse_hs256: bool = False,
         rejection_seconds: float = 30.0,
         max_cached: int = MAX_CACHED,
         wall_clock: Callable[[], float] = time.time,
@@ -284,10 +322,19 @@ class SupabaseAuthenticator:
         self._cache_seconds = cache_seconds
         self._rejection_seconds = rejection_seconds
         self._require_confirmed_email = require_confirmed_email
+        self._refuse_hs256 = refuse_hs256
         self._fetch = fetch
         self._clock = clock
         self._wall_clock = wall_clock
-        self._keys = _PublishedKeys(f"{base}/auth/v1/.well-known/jwks.json", api_key, fetch, clock)
+        self._keys = _PublishedKeys(
+            f"{base}/auth/v1/.well-known/jwks.json",
+            api_key,
+            fetch,
+            clock,
+            # Said once, when the keys first appear, to whoever has yet to
+            # turn the setting on.
+            on_published=None if refuse_hs256 else _warn_hs256_still_accepted,
+        )
         # Keyed by a hash so raw tokens are not kept in memory longer than
         # the request that carried them. Bounded, and expired on read: it
         # used to be rebuilt in full on every miss, which made a stream of
@@ -313,10 +360,20 @@ class SupabaseAuthenticator:
         header, claims = parsed
         lifetime = float(claims["exp"]) - self._wall_clock()
 
-        if header["alg"] not in ASYMMETRIC_ALGORITHMS and self._keys.published():
-            # The project signs with an asymmetric key, so it issued no
-            # HS256 token. Anyone can write one, and each used to be sent
-            # to Supabase to be turned down.
+        # The keys are looked at before the setting, so that a project still
+        # signing with the shared secret is told when its keys appear.
+        if (
+            header["alg"] not in ASYMMETRIC_ALGORITHMS
+            and self._keys.published()
+            and self._refuse_hs256
+        ):
+            # The project has finished moving to an asymmetric key, so no
+            # HS256 token it issued is still live. Anyone can write one, and
+            # each would be sent to Supabase to be turned down.
+            #
+            # Never while no keys are held, whatever the setting: a project
+            # that publishes none signs every token with the shared secret,
+            # and a failed fetch would otherwise sign everyone out.
             return self._answer(self._remember(key, None, now))
 
         if header["alg"] in ASYMMETRIC_ALGORITHMS:
@@ -333,8 +390,8 @@ class SupabaseAuthenticator:
                     )
                 return self._answer(self._remember(key, outcome, now, lifetime))
 
-        # HS256 from a project that publishes no keys, or the published keys
-        # could not be fetched: only Supabase can say.
+        # HS256 that was not refused above, or the published keys could not
+        # be fetched: only Supabase can say.
         return self._answer(self._remember(key, self._ask_supabase(token), now, lifetime))
 
     @staticmethod

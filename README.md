@@ -230,6 +230,7 @@ All optional; the defaults cover local development and the known deployments.
 | `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
 | `MAX_STORED_RUNS_PER_USER` | `20` | Recorded runs kept per person; a new run deletes their oldest finished ones beyond it (`0` keeps them all until they age out). Must not be lower than `MAX_RUNS_PER_USER_PER_HOUR`, whose count is read from these rows; a lower value is an error at start-up |
 | `REQUIRE_CONFIRMED_EMAIL` | `true` | Refuse accounts without a confirmed email address, anonymous sign-ins included (`403`). Turn off only if the app signs people in by phone |
+| `REFUSE_HS256_TOKENS` | `false` | Refuse tokens signed with the project's legacy shared secret (HS256) once it publishes asymmetric signing keys, without asking Supabase. Leave off until the project has moved to those keys and its older sessions have expired (see Moving to asymmetric signing keys) |
 | `MAX_JOBS_PER_IP` | `3` | Runs one client address may have queued or running at once, across all its accounts |
 | `SUBMIT_RATE_LIMIT_PER_MINUTE` | `6` | `POST /simulations` requests per minute per client address (`0` turns it off) |
 | `POLL_RATE_LIMIT_PER_MINUTE` | `120` | `GET /simulations/...` requests per minute per client address (`0` turns it off) |
@@ -313,16 +314,60 @@ JWT for this project (`iss`), for a signed-in user (`aud` and `role` both
 `authenticated`), not expired, with an allowed algorithm. A token signed
 with one of the project's asymmetric keys (ES256/RS256) then has its
 signature checked against the keys Supabase publishes, so a forged token
-never reaches Supabase. Once the project publishes such keys, a token
-claiming the legacy shared secret (HS256) is refused the same way; while
-it publishes none, HS256 tokens go on to Supabase. Every token still
-standing is then confirmed with Supabase Auth, which knows whether the
-session is still live. Answers are cached
-for a minute (refusals for 30 seconds). With `REQUIRE_CONFIRMED_EMAIL` on,
-an account without a confirmed email gets `403`.
+never reaches Supabase. A token claiming the legacy shared secret (HS256)
+has no signature the server can check, so it goes on to Supabase, unless
+`REFUSE_HS256_TOKENS` is on and the project publishes asymmetric keys:
+then it is refused the same way. Every token still standing is then
+confirmed with Supabase Auth, which knows whether the session is still
+live. Answers are cached for a minute (refusals for 30 seconds). With
+`REQUIRE_CONFIRMED_EMAIL` on, an account without a confirmed email gets
+`403`.
 
 > **Signing out is not instant.** A token is accepted for up to a minute
 > after its session is revoked, while its cached answer lasts.
+
+**Moving to asymmetric signing keys.** A Supabase project can move from
+the shared secret to an asymmetric signing key. This server needs nothing
+set for that, and one setting changed when it is over:
+
+1. **Before and during the move, set nothing.** Leave `REFUSE_HS256_TOKENS`
+   unset. Supabase lists the new key before it signs with it, and sessions
+   signed with the shared secret stay valid until they expire; with the
+   setting off, those tokens keep going to Supabase and keep working. The
+   server used to refuse them as soon as a key was listed, which would
+   have signed everyone out part-way through.
+2. **When the project starts signing with the new key,** the server picks
+   it up on its own: within a minute of the first token signed with it, or
+   within ten otherwise. Until it has, and while the server holds no
+   published keys, such tokens go to Supabase like the others, so nobody
+   is turned away meanwhile. Once the server holds a key, a token naming a
+   key it does not list is refused, so on any later rotation wait at least
+   20 minutes after creating the standby key. No restart is needed.
+3. **The server says when it has seen the keys:** one warning in the log,
+   `The project publishes asymmetric signing keys, and tokens signed with
+   the shared secret (HS256) are still accepted`. From here a forged HS256
+   token is still turned down, but by Supabase, at the cost of a call.
+4. **Last, set `REFUSE_HS256_TOKENS=true`,** once every session signed
+   with the shared secret has expired. HS256 tokens are then refused
+   without a call. Setting it earlier signs out whoever still holds one.
+
+Whatever the setting, HS256 tokens are never refused this way while the
+server holds no published keys: a project that publishes none signs every
+token with the shared secret, and a failed fetch of the keys would
+otherwise sign everyone out.
+
+The setting does not cover `SUPABASE_ANON_KEY` and
+`SUPABASE_SERVICE_ROLE_KEY`. In their legacy form those are JWTs signed
+with the same shared secret, so they stop working if it is revoked: the
+first would fail every sign-in check, the second every read and write of
+`simulation_runs`. Both must be replaced before the secret goes.
+`SUPABASE_ANON_KEY` can take a publishable key as it is: the server sends
+it only as `apikey`. `SUPABASE_SERVICE_ROLE_KEY` is also sent as
+`Authorization: Bearer` (`app/runs.py`), which Supabase's docs say a
+secret key must not use; whether it is tolerated is unverified, so change
+that or test it while the legacy key still works. Full list and order:
+[docs/ASYMMETRIC_KEYS_RUNBOOK.md](docs/ASYMMETRIC_KEYS_RUNBOOK.md),
+stage 5.
 
 **Limits.** Each client address may start 6 runs a minute and poll 120
 times a minute (`429` past either), and hold 3 queued or running runs

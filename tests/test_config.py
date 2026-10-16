@@ -44,6 +44,26 @@ class TestFlags:
             Settings.from_env()
 
 
+class TestRefusingSharedSecretTokens:
+    """``REFUSE_HS256_TOKENS`` is turned on last, when a project has moved
+    to asymmetric signing keys and its older sessions have expired."""
+
+    def test_it_is_off_unless_set(self, monkeypatch):
+        monkeypatch.delenv("REFUSE_HS256_TOKENS", raising=False)
+        assert Settings.from_env().refuse_hs256_tokens is False
+        assert Settings().refuse_hs256_tokens is False
+
+    @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("1", True), ("false", False)])
+    def test_it_is_read_from_the_environment(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("REFUSE_HS256_TOKENS", raw)
+        assert Settings.from_env().refuse_hs256_tokens is expected
+
+    def test_a_mistyped_value_is_an_error(self, monkeypatch):
+        monkeypatch.setenv("REFUSE_HS256_TOKENS", "ture")
+        with pytest.raises(ValueError, match="REFUSE_HS256_TOKENS"):
+            Settings.from_env()
+
+
 class TestStoredRunsCoverTheHour:
     """The hourly allowance is counted from the stored runs, so a restart
     doesn't reset it. Keeping fewer than an hour's worth deleted the rows

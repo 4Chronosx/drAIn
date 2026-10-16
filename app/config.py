@@ -151,6 +151,14 @@ class Settings:
     #: off only if the app signs people in by phone.
     require_confirmed_email: bool = True
 
+    #: Refuse tokens signed with the project's legacy shared secret (HS256)
+    #: once it publishes asymmetric signing keys. Off while a project moves
+    #: to those keys: it lists the new key before signing with it, and the
+    #: sessions already signed with the secret stay valid until they
+    #: expire. Turn on last, when they have; until then a forged HS256
+    #: token costs a call to Supabase to be turned down.
+    refuse_hs256_tokens: bool = False
+
     #: Runs one client address may have queued or running at once, across
     #: every account it signs in with. Kept above one for people sharing a
     #: network (an office, a campus).
@@ -215,6 +223,7 @@ class Settings:
             max_jobs_per_user=int(os.getenv("MAX_JOBS_PER_USER", "1")),
             max_runs_per_user_per_hour=int(os.getenv("MAX_RUNS_PER_USER_PER_HOUR", "10")),
             require_confirmed_email=_env_flag("REQUIRE_CONFIRMED_EMAIL", True),
+            refuse_hs256_tokens=_env_flag("REFUSE_HS256_TOKENS", False),
             max_jobs_per_ip=int(os.getenv("MAX_JOBS_PER_IP", "3")),
             submit_rate_per_minute=int(os.getenv("SUBMIT_RATE_LIMIT_PER_MINUTE", "6")),
             poll_rate_per_minute=int(os.getenv("POLL_RATE_LIMIT_PER_MINUTE", "120")),

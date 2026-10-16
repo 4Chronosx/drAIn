@@ -13,9 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import polling as app_polling
-from app.auth import AccountRefusedError, AuthUnavailableError, Caller
+from app.auth import AccountRefusedError, AuthUnavailableError, Caller, SupabaseAuthenticator
 from app.config import VERCEL_PREVIEW_ORIGIN_REGEX, settings
-from app.main import create_app
+from app.main import _build_authenticator, create_app
 from app.schemas import MAX_NODE_OVERRIDES, SimulationRequest
 from app.simulation import baseline_result, is_baseline
 from drain.flooding import build_flooding_summary as flooding_summary_for_test
@@ -798,6 +798,20 @@ DEPLOYED = {
     "submit_rate_per_minute": 6,
     "poll_rate_per_minute": 120,
 }
+
+
+class TestBuildingTheAuthenticator:
+    @pytest.mark.parametrize("refuse", [False, True])
+    def test_refusing_hs256_tokens_follows_the_setting(self, refuse):
+        config = replace(TEST_SETTINGS, **DEPLOYED, refuse_hs256_tokens=refuse)
+        built = _build_authenticator(config)
+        assert isinstance(built, SupabaseAuthenticator)
+        assert built._refuse_hs256 is refuse
+
+    def test_turning_it_on_does_not_stop_a_deployment_starting(self):
+        app = make_app(environ=ON_RENDER, **DEPLOYED, refuse_hs256_tokens=True)
+        with TestClient(app) as deployed:
+            assert deployed.get("/health").status_code == 200
 
 
 class TestDeploymentGuard:
