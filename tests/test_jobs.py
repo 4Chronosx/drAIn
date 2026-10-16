@@ -644,3 +644,175 @@ class TestRecentRunCountsAreForgotten:
 
         store.get("anything")
         assert set(store._recent_runs) == {"here"}
+
+
+class TestOwnersTakeTurns:
+    """Jobs started in the order they arrived, so a newcomer let into the
+    queue still waited behind every run a few accounts had put in it. A
+    free worker now takes the job of whoever has waited longest for one."""
+
+    def start_order(self, queued, running=None, **limits):
+        """Queue ``(owner, name)`` jobs behind one that is running, let
+        them all run, and return the names in the order they started."""
+        store = JobStore(max_workers=1, max_queued=16, retention=timedelta(minutes=5), **limits)
+        release = threading.Event()
+        started = []
+
+        def named(name):
+            def work():
+                started.append(name)
+                return {}
+
+            return work
+
+        try:
+            first = store.submit(hang_until(release), owner=running)
+            wait_until(lambda: store.get(first.id).status is JobStatus.RUNNING)
+            jobs = [store.submit(named(name), owner=owner) for owner, name in queued]
+            # One worker, so nothing has started behind the first.
+            assert started == []
+            release.set()
+            for job in jobs:
+                assert wait_for(job, store).status is JobStatus.SUCCEEDED
+        finally:
+            release.set()
+            store.shutdown()
+        return started
+
+    def test_two_owners_interleave(self):
+        queued = [("a", "a1"), ("a", "a2"), ("a", "a3"), ("b", "b1"), ("b", "b2")]
+        assert self.start_order(queued) == ["a1", "b1", "a2", "b2", "a3"]
+
+    def test_one_owners_jobs_start_in_the_order_they_arrived(self):
+        queued = [("a", f"a{n}") for n in range(1, 6)]
+        assert self.start_order(queued) == ["a1", "a2", "a3", "a4", "a5"]
+
+    def test_a_newcomer_goes_ahead_of_someone_who_has_just_had_a_turn(self):
+        queued = [("a", "a2"), ("a", "a3"), ("b", "b1")]
+        assert self.start_order(queued, running="a") == ["b1", "a2", "a3"]
+
+    def test_owners_who_are_level_go_in_the_order_they_arrived(self):
+        queued = [("c", "c1"), ("a", "a1"), ("b", "b1")]
+        assert self.start_order(queued) == ["c1", "a1", "b1"]
+
+    def test_whoever_started_longest_ago_is_next(self):
+        # a, then b, then c have each had a turn; they queue again in the
+        # opposite order.
+        store = JobStore(max_workers=1, max_queued=16, retention=timedelta(minutes=5))
+        release = threading.Event()
+        started = []
+        try:
+            for owner in ("a", "b", "c"):
+                wait_for(store.submit(lambda: {}, owner=owner), store)
+            first = store.submit(hang_until(release), owner="d")
+            wait_until(lambda: store.get(first.id).status is JobStatus.RUNNING)
+            jobs = [
+                store.submit(lambda owner=owner: (started.append(owner), {})[1], owner=owner)
+                for owner in ("c", "b", "a")
+            ]
+            release.set()
+            for job in jobs:
+                wait_for(job, store)
+            assert started == ["a", "b", "c"]
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_work_without_an_owner_takes_turns_as_one(self):
+        queued = [(None, "x1"), (None, "x2"), ("a", "a1"), (None, "x3")]
+        assert self.start_order(queued, running="b") == ["x1", "a1", "x2", "x3"]
+
+    def test_the_times_reported_are_in_the_order_started(self):
+        # The API reports no place in the queue, only when a job started.
+        store = JobStore(max_workers=1, max_queued=16, retention=timedelta(minutes=5))
+        release = threading.Event()
+
+        def brief():
+            # Longer than a tick of a coarse clock, so no two starts share one.
+            threading.Event().wait(0.05)
+            return {}
+
+        try:
+            first = store.submit(hang_until(release))
+            wait_until(lambda: store.get(first.id).status is JobStatus.RUNNING)
+            a1, a2, b1 = (store.submit(brief, owner=owner) for owner in ("a", "a", "b"))
+            release.set()
+            in_turn = [wait_for(job, store) for job in (a1, b1, a2)]
+            assert all(job.status is JobStatus.SUCCEEDED for job in in_turn)
+            assert in_turn[0].started_at < in_turn[1].started_at < in_turn[2].started_at
+            assert in_turn[1].finished_at <= in_turn[2].started_at
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_job_dropped_from_the_queue_does_not_cost_another_its_turn(self):
+        store = JobStore(max_workers=1, max_queued=16, retention=timedelta(minutes=5))
+        release = threading.Event()
+        try:
+            first = store.submit(hang_until(release), owner="a")
+            wait_until(lambda: store.get(first.id).status is JobStatus.RUNNING)
+            dropped = store.submit(lambda: {"ran": "dropped"}, owner="b")
+            kept = store.submit(lambda: {"ran": "kept"}, owner="c")
+            with store._lock:
+                store._finish(store._entries[dropped.id], error="dropped")
+            release.set()
+
+            assert wait_for(kept, store).result == {"ran": "kept"}
+            assert store.get(dropped.id).error == "dropped"
+            assert store.outstanding() == 0
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_turns_survive_a_move_to_a_fresh_pool(self):
+        store = JobStore(
+            max_workers=1,
+            max_queued=16,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=500),
+        )
+        release = threading.Event()
+        started = []
+        try:
+            stuck = store.submit(hang_until(release), owner="a")
+            jobs = [
+                store.submit(lambda name=name: (started.append(name), {})[1], owner=owner)
+                for owner, name in [("a", "a2"), ("a", "a3"), ("b", "b1")]
+            ]
+            for job in jobs:
+                assert wait_for(job, store).status is JobStatus.SUCCEEDED
+            assert started == ["b1", "a2", "a3"]
+            assert store.get(stuck.id).status is JobStatus.FAILED
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_the_old_pool_starts_nothing_once_its_worker_is_free(self):
+        """Its requests for a worker were made for jobs the fresh pool now
+        has. Left in place, the freed worker would start one beside the
+        fresh pool's, two at once on a server set to run one."""
+        store = JobStore(
+            max_workers=1,
+            max_queued=16,
+            retention=timedelta(minutes=5),
+            max_runtime=timedelta(milliseconds=500),
+        )
+        release_stuck = threading.Event()
+        release_next = threading.Event()
+        try:
+            stuck = store.submit(hang_until(release_stuck))
+            behind = store.submit(hang_until(release_next))
+            wait_until(lambda: store.get(stuck.id).status is JobStatus.FAILED)
+            wait_until(lambda: store.get(behind.id).status is JobStatus.RUNNING)
+            waiting = store.submit(lambda: {})
+
+            release_stuck.set()
+            threading.Event().wait(0.3)
+            assert store.get(waiting.id).status is JobStatus.QUEUED
+
+            release_next.set()
+            assert wait_for(waiting, store).status is JobStatus.SUCCEEDED
+        finally:
+            release_stuck.set()
+            release_next.set()
+            store.shutdown()

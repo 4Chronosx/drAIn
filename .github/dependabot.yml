@@ -1,0 +1,17 @@
+version: 2
+
+updates:
+  # The pinned and hashed requirements files (requirements.txt and
+  # requirements-dev.txt, compiled from their .in files).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  # The actions the workflows pin to a commit.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

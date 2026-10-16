@@ -193,7 +193,8 @@ def _recent_runs(repository: RunRepository | None, owner: str, config: Settings)
 
 
 def _refuse_insecure_deployment(config: Settings, environ: Mapping[str, str]) -> None:
-    """Stop a deployed server from starting with settings that leave it open.
+    """Stop a deployed server from starting with settings that leave it open,
+    or up and refusing every run.
 
     A warning in the log of a server that started anyway is read by nobody;
     a deploy that fails is. ``ALLOW_INSECURE_DEPLOY`` starts it regardless.
@@ -353,9 +354,13 @@ def create_app(
             # it. Assumes one server instance, as the Procfile runs.
             try:
                 repository.fail_unfinished(RESTARTED_MESSAGE)
+            except RunStoreError:
+                logger.exception("Could not mark the last process's unfinished runs failed")
+            # On its own, so the table is still pruned if that failed.
+            try:
                 repository.prune(datetime.now(UTC) - timedelta(days=config.run_retention_days))
             except RunStoreError:
-                logger.exception("Could not tidy recorded simulation runs")
+                logger.exception("Could not prune recorded simulation runs")
         yield
         jobs.shutdown()
         isolation.kill_all()
@@ -487,8 +492,12 @@ def create_app(
                 # Gone from memory -- expired, or a restart -- but recorded.
                 try:
                     job = repository.load(job_id)
-                except RunStoreError:
-                    logger.exception("Could not read simulation %s back from Supabase", job_id)
+                except RunStoreError as error:
+                    # One line, no traceback: during an outage every poll for
+                    # a run not in memory lands here.
+                    logger.warning(
+                        "Could not read simulation %s back from Supabase: %s", job_id, error
+                    )
                 else:
                     if job is None:
                         # Asked again within seconds, the answer is the same.

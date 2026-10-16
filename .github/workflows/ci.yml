@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, develop]
   pull_request:
+  # Weekly as well (Mondays, 03:00 UTC), so an advisory published against
+  # a pinned dependency shows up while nobody is pushing.
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
 
 # The workflow only reads the code. Nothing it runs needs to write to the
 # repository, so the token it is handed can't.
