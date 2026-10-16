@@ -42,3 +42,25 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Check dependencies for known vulnerabilities
+        # What the server runs with, against the advisory database. The
+        # tool is pinned here and run with pipx rather than added to the
+        # requirements files, so it is never installed beside the app. A
+        # separate job, so a new advisory shows up as its own failure and
+        # not as a broken build.
+        run: pipx run pip-audit==2.9.0 --require-hashes -r requirements.txt

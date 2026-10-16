@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import os
+import re
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -21,7 +23,7 @@ from app.auth import (
     OpenAuthenticator,
     SupabaseAuthenticator,
 )
-from app.config import Settings, settings
+from app.config import Settings, deployment_problems, insecure_deploy_allowed, settings
 from app.jobs import (
     JobStore,
     JobStoreClosedError,
@@ -69,6 +71,11 @@ MAX_IDS_LISTED = 10
 #: What a run caught mid-way by a restart says when it is read back.
 RESTARTED_MESSAGE = "The simulation server restarted before this run finished. Please run it again."
 
+#: A job id as the job store writes one: a hyphenated UUID. Anything else in
+#: the path is not a job, and is turned away before it is looked up or
+#: remembered anywhere.
+_JOB_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
 
 def _build_run_repository(config: Settings) -> RunRepository | None:
     """Where runs are recorded durably, or ``None`` to keep them in memory only."""
@@ -92,6 +99,7 @@ def _build_job_store(config: Settings, listener=None) -> JobStore:
         max_runs_per_owner_per_hour=config.max_runs_per_user_per_hour,
         listener=listener,
         max_jobs_per_group=config.max_jobs_per_ip,
+        reserved_slots=config.queue_slots_reserved,
     )
 
 
@@ -184,6 +192,28 @@ def _recent_runs(repository: RunRepository | None, owner: str, config: Settings)
         return None
 
 
+def _refuse_insecure_deployment(config: Settings, environ: Mapping[str, str]) -> None:
+    """Stop a deployed server from starting with settings that leave it open.
+
+    A warning in the log of a server that started anyway is read by nobody;
+    a deploy that fails is. ``ALLOW_INSECURE_DEPLOY`` starts it regardless.
+    """
+    problems = deployment_problems(config, environ)
+    if not problems:
+        return
+    allowed = insecure_deploy_allowed(environ)
+    for problem in problems:
+        logger.log(
+            logging.WARNING if allowed else logging.ERROR, "Insecure deployment: %s", problem
+        )
+    if not allowed:
+        raise RuntimeError(
+            "Refusing to start on Render with insecure settings: "
+            + " ".join(problems)
+            + " Fix them, or set ALLOW_INSECURE_DEPLOY=true to start anyway."
+        )
+
+
 def _as_state(job: SimulationJob) -> JobState:
     return JobState(
         job_id=job.id,
@@ -265,8 +295,9 @@ def current_caller(request: Request) -> Caller:
         )
     try:
         caller = auth.authenticate(token.strip())
-    except AuthUnavailableError:
-        logger.exception("Could not check a caller's sign-in")
+    except AuthUnavailableError as error:
+        # One line, no traceback: during an outage every request lands here.
+        logger.warning("Could not check a caller's sign-in: %s", error)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not check your sign-in. Try again shortly.",
@@ -291,13 +322,22 @@ def create_app(
     config: Settings = settings,
     authenticator: Authenticator | None = None,
     runs: RunRepository | None = None,
+    environ: Mapping[str, str] = os.environ,
 ) -> FastAPI:
     """Build the application. Kept separate from the module-level instance so
-    tests can construct an app with their own settings, sign-in check and
-    run record."""
+    tests can construct an app with their own settings, sign-in check, run
+    record and environment (read at start-up for where the server runs)."""
     auth = authenticator if authenticator is not None else _build_authenticator(config)
     repository = runs if runs is not None else _build_run_repository(config)
-    recorder = RunRecorder(repository) if repository is not None else None
+    recorder = (
+        RunRecorder(
+            repository,
+            retention=timedelta(days=config.run_retention_days),
+            max_runs_per_owner=config.max_stored_runs_per_user or None,
+        )
+        if repository is not None
+        else None
+    )
     jobs = _build_job_store(config, listener=recorder.record if recorder else None)
     rendered = RenderedStates(ttl_seconds=config.result_retention_seconds)
 
@@ -305,6 +345,8 @@ def create_app(
     async def lifespan(app: FastAPI):
         """Set up logging, and settle runs a restart cut short."""
         configure_logging(config.log_level)
+        _refuse_insecure_deployment(config, environ)
+        isolation.sweep_stale_directories(older_than=config.max_runtime_seconds)
         if repository is not None:
             # This process has run nothing yet, so any run still marked
             # queued or running belonged to the one before it, and died with
@@ -368,8 +410,12 @@ def create_app(
     app.add_middleware(SecurityHeadersMiddleware)
 
     @app.get("/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
-        """Liveness probe."""
+    async def health() -> HealthResponse:
+        """Liveness probe.
+
+        Async, so it is answered on the event loop rather than waiting for a
+        thread behind requests that are blocked on Supabase.
+        """
         return HealthResponse(status="ok")
 
     @app.post(
@@ -431,6 +477,9 @@ def create_app(
         A finished job's response carries an ETag; sending it back in
         ``If-None-Match`` gets a bodiless 304 instead of the result again.
         """
+        if _JOB_ID.fullmatch(job_id) is None:
+            raise _not_found()
+        job_id = job_id.lower()
         finished = rendered.get(job_id)
         if finished is None:
             job = jobs.get(job_id)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import threading
-from datetime import timedelta
+from collections import deque
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -536,3 +537,110 @@ class TestGroupsAndOutsideCounts:
             assert store.submit(lambda: {}, owner="a", prior_runs=2).owner == "a"
         finally:
             store.shutdown()
+
+
+class TestReservedPlaces:
+    """The hourly allowance let a few accounts, each within it, hold every
+    place in the queue. The last places are kept for people who have run
+    little this hour, so someone running their first still gets in."""
+
+    def reserving(self, max_queued=4, reserved_slots=2):
+        return JobStore(
+            max_workers=1,
+            max_queued=max_queued,
+            retention=timedelta(minutes=5),
+            reserved_slots=reserved_slots,
+        )
+
+    def test_a_heavy_user_is_refused_the_last_places(self):
+        store = self.reserving()
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a")
+            store.submit(hang_until(release), owner="b")
+
+            with pytest.raises(QueueFullError, match="kept for people") as refusal:
+                store.submit(lambda: {}, owner="heavy", prior_runs=3)
+            # The queue's refusal, not a limit of their own to wait out.
+            assert not isinstance(refusal.value, UserLimitError)
+
+            # Someone who has run little takes them, until the queue is full.
+            store.submit(hang_until(release), owner="light", prior_runs=2)
+            store.submit(hang_until(release), owner="new")
+            with pytest.raises(QueueFullError, match=r"already queued or running\.$"):
+                store.submit(lambda: {}, owner="newer")
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_a_heavy_user_still_gets_the_places_anyone_may_take(self):
+        store = self.reserving()
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a")
+            assert store.submit(lambda: {}, owner="heavy", prior_runs=9).owner == "heavy"
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_runs_this_process_saw_count_as_use(self):
+        store = self.reserving()
+        release = threading.Event()
+        try:
+            for _ in range(3):
+                wait_for(store.submit(lambda: {}, owner="heavy"), store)
+            store.submit(hang_until(release), owner="a")
+            store.submit(hang_until(release), owner="b")
+            with pytest.raises(QueueFullError, match="kept for people"):
+                store.submit(lambda: {}, owner="heavy")
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_work_without_an_owner_is_held_only_to_the_cap(self):
+        store = self.reserving()
+        release = threading.Event()
+        try:
+            for _ in range(4):
+                store.submit(hang_until(release))
+            with pytest.raises(QueueFullError):
+                store.submit(lambda: {})
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_one_place_is_always_open_to_anyone(self):
+        # More reserved than the queue holds would shut heavy users out of
+        # an empty server.
+        store = self.reserving(max_queued=2, reserved_slots=5)
+        release = threading.Event()
+        try:
+            assert store.submit(hang_until(release), owner="heavy", prior_runs=9).owner == "heavy"
+            with pytest.raises(QueueFullError, match="kept for people"):
+                store.submit(lambda: {}, owner="other", prior_runs=9)
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_nothing_is_reserved_unless_asked(self):
+        store = JobStore(max_workers=1, max_queued=2, retention=timedelta(minutes=5))
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a")
+            assert store.submit(lambda: {}, owner="heavy", prior_runs=9).owner == "heavy"
+        finally:
+            release.set()
+            store.shutdown()
+
+
+class TestRecentRunCountsAreForgotten:
+    def test_an_owner_who_has_not_run_for_an_hour_is_dropped(self, store):
+        """Regression: a count was cleared only when its owner next
+        submitted, so everyone who ran once stayed in memory for good."""
+        wait_for(store.submit(lambda: {}, owner="gone"), store)
+        wait_for(store.submit(lambda: {}, owner="here"), store)
+        long_ago = datetime.now(UTC) - timedelta(hours=2)
+        store._recent_runs["gone"] = deque([long_ago])
+
+        store.get("anything")
+        assert set(store._recent_runs) == {"here"}

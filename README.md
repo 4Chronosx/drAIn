@@ -10,18 +10,18 @@
 </a>
 
 <div align="center">
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin">
+  <a href="https://github.com/4Chronosx/drAIn">
     <img src="logo.png" alt="drAIn Backend logo" width="40%" height="35%">
   </a>
   <br />
   <p align="center">
     <a href="#"><img alt="Status" src="https://img.shields.io/badge/status-Beta-yellow?style=flat&color=yellow" /></a>
     <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
-    <a href="https://github.com/4Chronosx/BACKEND-DrAin/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/BACKEND-DrAin?color=coral&logo=git&logoColor=white" /></a>
+    <a href="https://github.com/4Chronosx/drAIn/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/drAIn?color=coral&logo=git&logoColor=white" /></a>
   </p>
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
+  <a href="https://github.com/4Chronosx/drAIn/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
   &middot;
-  <a href="https://github.com/4Chronosx/BACKEND-DrAin/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
+  <a href="https://github.com/4Chronosx/drAIn/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
 </div>
 
 ---
@@ -155,8 +155,8 @@ The SWMM engine ships with `pyswmm`, so no separate install is needed.
 
 ```bash
 # Clone the repository
-git clone https://github.com/4Chronosx/BACKEND-DrAin.git
-cd BACKEND-DrAin
+git clone https://github.com/4Chronosx/drAIn.git
+cd drAIn
 
 # Create virtual environment
 python -m venv venv
@@ -202,8 +202,8 @@ python -m drain.cli --precip 400 --duration 24 --node I-4
 
 ```bash
 pytest
-ruff check drain app tests
-ruff format --check drain app tests
+ruff check app drain tests scripts
+ruff format --check app drain tests scripts
 ```
 
 ### 🔧 Configuration
@@ -217,6 +217,7 @@ All optional; the defaults cover local development and the known deployments.
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
+| `QUEUE_SLOTS_RESERVED` | `2` | The last places in the queue are kept for people who have started at most two runs in the past hour (`0` keeps none back) |
 | `RESULT_RETENTION_SECONDS` | `900` | How long a finished result stays pollable |
 | `MAX_RUNTIME_SECONDS` | `1800` | A run still going after this is failed, its queue slot freed, and the jobs behind it moved to a fresh worker |
 | `MAX_QUEUE_WAIT_SECONDS` | `3600` | A job still waiting to start after this is failed |
@@ -227,6 +228,7 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_RUNS_PER_USER_PER_HOUR` | `10` | Runs one person may start in an hour |
 | `SUPABASE_SERVICE_ROLE_KEY` | unset | Records every run in the `simulation_runs` table so results survive a restart. A secret: set it only in the host's environment |
 | `RUN_RETENTION_DAYS` | `7` | How long recorded runs are kept |
+| `MAX_STORED_RUNS_PER_USER` | `20` | Recorded runs kept per person; a new run deletes their oldest finished ones beyond it (`0` keeps them all until they age out) |
 | `REQUIRE_CONFIRMED_EMAIL` | `true` | Refuse accounts without a confirmed email address, anonymous sign-ins included (`403`). Turn off only if the app signs people in by phone |
 | `MAX_JOBS_PER_IP` | `3` | Runs one client address may have queued or running at once, across all its accounts |
 | `SUBMIT_RATE_LIMIT_PER_MINUTE` | `6` | `POST /simulations` requests per minute per client address (`0` turns it off) |
@@ -235,6 +237,10 @@ All optional; the defaults cover local development and the known deployments.
 | `MAX_REQUEST_BYTES` | `655360` | Largest request body accepted (`413` above it). The biggest real request, every node and link with every field, is about 495 KB |
 | `ISOLATE_SIMULATIONS` | `true` | Run each simulation in a child process that is killed at `MAX_RUNTIME_SECONDS` |
 | `ENABLE_DOCS` | `false` | Serve `/docs`, `/redoc` and `/openapi.json` |
+| `ALLOW_INSECURE_DEPLOY` | `false` | Start on Render even with `REQUIRE_AUTH` off or `TRUSTED_PROXY_HOPS` at `0`, which otherwise stop the server starting there (see Deployment) |
+
+A switch takes `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0`. Anything
+else is an error at start-up rather than a guess.
 
 Without `SUPABASE_URL` and `SUPABASE_ANON_KEY` the server refuses every
 simulation with `503` rather than opening them to everyone. To try the API
@@ -307,9 +313,11 @@ JWT for this project (`iss`), for a signed-in user (`aud` and `role` both
 `authenticated`), not expired, with an allowed algorithm. A token signed
 with one of the project's asymmetric keys (ES256/RS256) then has its
 signature checked against the keys Supabase publishes, so a forged token
-never reaches Supabase. Every token still standing, including legacy
-shared-secret (HS256) ones, is then confirmed with Supabase Auth, which
-knows whether the session is still live. Answers are cached
+never reaches Supabase. Once the project publishes such keys, a token
+claiming the legacy shared secret (HS256) is refused the same way; while
+it publishes none, HS256 tokens go on to Supabase. Every token still
+standing is then confirmed with Supabase Auth, which knows whether the
+session is still live. Answers are cached
 for a minute (refusals for 30 seconds). With `REQUIRE_CONFIRMED_EMAIL` on,
 an account without a confirmed email gets `403`.
 
@@ -320,8 +328,11 @@ an account without a confirmed email gets `403`.
 times a minute (`429` past either), and hold 3 queued or running runs
 across all its accounts. Each account may hold one, and start 10 an hour;
 with `SUPABASE_SERVICE_ROLE_KEY` set, the hour is counted from the
-`simulation_runs` table, so a restart doesn't reset it. Request bodies over
-640 KB get `413`.
+`simulation_runs` table, so a restart doesn't reset it. An IPv6 caller is
+counted as their /64 network, since they can send from any address in it.
+The last 2 of the queue's 8 places are kept for accounts that have started
+at most two runs in the past hour, so a few heavy users can't fill it
+against everyone else. Request bodies over 640 KB get `413`.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
   and where to poll. Returns `429` when the caller already has a run going,
@@ -379,7 +390,9 @@ starts and finishes (the table is defined in the frontend repository's
 `supabase/schemas/schema_ops.sql`). A poll for a run the server no longer
 holds in memory — it expired, or the server restarted — is answered from
 there. On start-up, runs a restart cut short are marked failed with a
-message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted.
+message saying so, and runs older than `RUN_RETENTION_DAYS` are deleted;
+while the server stays up they are deleted once an hour, and each new run
+trims its owner's finished runs to the newest `MAX_STORED_RUNS_PER_USER`.
 Users can read their own runs from the table; nobody but the server can
 write them. Without the key, runs live in memory only and are lost on a
 restart; the server logs a warning at start-up.
@@ -420,17 +433,25 @@ The backend is deployed on Render and serves the production API:
 
 `Procfile` starts `app.main:app` and binds `$PORT`.
 
-In production, also set:
+**The server refuses to start on Render** (where `RENDER` is set in the
+environment) unless `TRUSTED_PROXY_HOPS` is at least `1` and `REQUIRE_AUTH`
+is on. It logs what is wrong and exits, so the deploy fails instead of
+serving open or with one rate limit shared by everyone. Setting
+`ALLOW_INSECURE_DEPLOY=true` starts it anyway, with warnings.
 
-- `TRUSTED_PROXY_HOPS=1`. Render's proxy connects to the app, so without it
-  every caller has the proxy's address and they all share one rate limit.
+Before the first deploy, set:
+
+- `TRUSTED_PROXY_HOPS=1` (**required**). Render's proxy connects to the
+  app, so without it every caller has the proxy's address and they all
+  share one rate limit.
   The server reads the address the proxy appended to `X-Forwarded-For`, not
   the leftmost entry, which the caller writes. (Uvicorn's
   `--forwarded-allow-ips='*'` takes the leftmost, so it is not used.) If
   another proxy, such as a CDN, sits in front of Render, count it too. The
   server logs a warning if it sees `X-Forwarded-For` while this is `0`.
 - `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`.
-- Leave `ENABLE_DOCS` unset.
+- Leave `REQUIRE_AUTH` unset or `true` (**required**).
+- Leave `ENABLE_DOCS` and `ALLOW_INSECURE_DEPLOY` unset.
 
 ---
 
@@ -447,8 +468,8 @@ Don't forget to give the project a star! Thanks again!
 
 ### 📢 Contributors
 
-<a href="https://github.com/4Chronosx/BACKEND-DrAin/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=4Chronosx/BACKEND-DrAin" alt="contrib.rocks image" />
+<a href="https://github.com/4Chronosx/drAIn/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=4Chronosx/drAIn" alt="contrib.rocks image" />
 </a>
 
 ---
@@ -469,12 +490,12 @@ You may redistribute and/or modify it under the terms of the GNU GPL, as publish
 <p align="center">Made with 💧 for flood-resilient cities</p>
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[contributors-shield]: https://img.shields.io/github/contributors/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[contributors-url]: https://github.com/4Chronosx/BACKEND-DrAin/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[forks-url]: https://github.com/4Chronosx/BACKEND-DrAin/network/members
-[stars-shield]: https://img.shields.io/github/stars/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[stars-url]: https://github.com/4Chronosx/BACKEND-DrAin/stargazers
-[issues-shield]: https://img.shields.io/github/issues/4Chronosx/BACKEND-DrAin.svg?style=for-the-badge
-[issues-url]: https://github.com/4Chronosx/BACKEND-DrAin/issues
+[contributors-shield]: https://img.shields.io/github/contributors/4Chronosx/drAIn.svg?style=for-the-badge
+[contributors-url]: https://github.com/4Chronosx/drAIn/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/4Chronosx/drAIn.svg?style=for-the-badge
+[forks-url]: https://github.com/4Chronosx/drAIn/network/members
+[stars-shield]: https://img.shields.io/github/stars/4Chronosx/drAIn.svg?style=for-the-badge
+[stars-url]: https://github.com/4Chronosx/drAIn/stargazers
+[issues-shield]: https://img.shields.io/github/issues/4Chronosx/drAIn.svg?style=for-the-badge
+[issues-url]: https://github.com/4Chronosx/drAIn/issues
 

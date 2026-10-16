@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 
 import jwt
@@ -346,3 +347,123 @@ class TestSignatureCheckedLocally:
         fake = FakeSupabase(keys=[key], jwks_status=503, status=500, body=b"")
         with pytest.raises(AuthUnavailableError):
             authenticator(fake).authenticate(key.sign())
+
+
+class TestSharedSecretTokens:
+    """A project that publishes asymmetric keys signs with them. A token
+    saying HS256 is then one somebody wrote, and each used to be sent to
+    Supabase to be turned down."""
+
+    def test_an_hs256_token_is_refused_once_keys_are_published(self):
+        fake = FakeSupabase(keys=[SigningKey()])
+        auth = authenticator(fake)
+        token = unsigned()
+        assert auth.authenticate(token) is None
+        assert auth.authenticate(token) is None
+        assert fake.calls == []
+        assert fake.jwks_calls == 1
+
+    def test_it_is_still_asked_about_while_the_project_publishes_no_keys(self):
+        fake = FakeSupabase(keys=[])
+        assert authenticator(fake).authenticate(unsigned()) == Caller("user-1")
+        assert len(fake.calls) == 1
+
+    def test_it_is_still_asked_about_while_the_keys_cannot_be_fetched(self):
+        fake = FakeSupabase(keys=[SigningKey()], jwks_status=503)
+        assert authenticator(fake).authenticate(unsigned()) == Caller("user-1")
+        assert len(fake.calls) == 1
+
+
+class TestRefusalsAreCachedApart:
+    """Made-up tokens are free to produce. Sharing one bounded cache, a
+    flood of them pushed out the people actually signed in, who then each
+    cost a call to Supabase again."""
+
+    def test_a_flood_of_junk_does_not_evict_a_signed_in_caller(self):
+        fake = FakeSupabase()
+        auth = authenticator(fake, max_cached=2)
+        token = unsigned()
+        assert auth.authenticate(token) == Caller("user-1")
+
+        for n in range(10):
+            assert auth.authenticate(f"junk-{n}") is None
+        assert auth.authenticate(token) == Caller("user-1")
+        assert len(fake.calls) == 1
+
+    def test_refusals_are_bounded_too(self):
+        auth = authenticator(FakeSupabase(), max_cached=2)
+        for n in range(10):
+            auth.authenticate(f"junk-{n}")
+        assert len(auth._refused) == 2
+        assert len(auth._tokens) == 0
+
+    def test_an_unconfirmed_account_does_not_take_an_accepted_place(self):
+        user = {"id": "user-1", "email_confirmed_at": None}
+        auth = authenticator(FakeSupabase(body=json.dumps(user).encode()))
+        with pytest.raises(AccountRefusedError):
+            auth.authenticate(unsigned())
+        assert (len(auth._tokens), len(auth._refused)) == (0, 1)
+
+
+class StallingSupabase(FakeSupabase):
+    """Holds a fetch of the published keys open until released."""
+
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.stall = False
+        self.fetching = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, url, headers):
+        if url == JWKS_URL and self.stall:
+            self.fetching.set()
+            self.release.wait(10)
+        return super().__call__(url, headers)
+
+
+class TestRefreshingThePublishedKeys:
+    """The keys were refetched while holding their lock, so for as long as
+    Supabase took to answer -- up to five seconds -- every other token with
+    a signature to check waited behind it."""
+
+    def test_a_slow_refetch_does_not_hold_up_other_callers(self):
+        key = SigningKey()
+        fake = StallingSupabase(keys=[key])
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        assert auth.authenticate(key.sign(jti="first")) == Caller("user-1")
+
+        clock.now += 601
+        fake.stall = True
+        answers = []
+        refresher = threading.Thread(
+            target=lambda: answers.append(auth.authenticate(key.sign(jti="second")))
+        )
+        refresher.start()
+        try:
+            assert fake.fetching.wait(5)
+            started = time.monotonic()
+            # Checked against the keys already held.
+            assert auth.authenticate(key.sign(jti="third")) == Caller("user-1")
+            assert auth.authenticate(SigningKey().sign()) is None
+            assert time.monotonic() - started < 2
+            assert refresher.is_alive()
+        finally:
+            fake.release.set()
+            refresher.join(10)
+        assert answers == [Caller("user-1")]
+        assert fake.jwks_calls == 2
+
+    def test_a_failed_refetch_keeps_the_keys_already_held(self):
+        key = SigningKey()
+        fake = FakeSupabase(keys=[key])
+        clock = Clock()
+        auth = authenticator(fake, clock)
+        auth.authenticate(key.sign())
+
+        fake.jwks_status = 503
+        clock.now += 601
+        assert auth.authenticate(SigningKey().sign()) is None
+        assert auth.authenticate(unsigned()) is None
+        assert fake.jwks_calls == 2
+        assert len(fake.calls) == 1
