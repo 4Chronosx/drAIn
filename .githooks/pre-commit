@@ -6,5 +6,9 @@ set -e
 RUFF=ruff
 [ -x .venv/Scripts/ruff.exe ] && RUFF=.venv/Scripts/ruff.exe
 [ -x .venv/bin/ruff ] && RUFF=.venv/bin/ruff
+if ! command -v "$RUFF" >/dev/null 2>&1; then
+  echo "ruff not found: create .venv and run pip install --require-hashes -r requirements-dev.txt" >&2
+  exit 1
+fi
 "$RUFF" format --check app drain tests scripts
 "$RUFF" check app drain tests scripts
