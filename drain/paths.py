@@ -30,3 +30,9 @@ def mod_artifacts(inp_path: Path) -> tuple[Path, Path]:
     """
     stem = f"{inp_path.stem}_mod"
     return inp_path.with_name(f"{stem}.rpt"), inp_path.with_name(f"{stem}.out")
+
+
+#: Reported Mandaue floods (Google Groundsource) and the hourly rain they are
+#: compared against. Offline research inputs; the API never reads them.
+FLOOD_EVENTS = DATA_DIR / "flood_events" / "groundsource_mandaue.csv"
+RAIN_CACHE = DATA_DIR / "rain" / "openmeteo_mandaue_hourly_2011_2025.csv"
