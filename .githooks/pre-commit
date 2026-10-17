@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fast subset of CI's quality job (.github/workflows/ci.yml): the two ruff checks.
+# pytest (~1 min) runs in CI and in the gate before each commit, not here.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+RUFF=ruff
+[ -x .venv/Scripts/ruff.exe ] && RUFF=.venv/Scripts/ruff.exe
+[ -x .venv/bin/ruff ] && RUFF=.venv/bin/ruff
+"$RUFF" format --check app drain tests scripts
+"$RUFF" check app drain tests scripts
