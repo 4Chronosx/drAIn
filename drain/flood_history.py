@@ -105,7 +105,7 @@ def load_events(
         for row in csv.DictReader(handle):
             area = float(row["area_km2"])
             if area >= max_area_km2:
-                dropped[f"{max_area_km2:g} km² or larger"] += 1
+                dropped[f"{max_area_km2:g} km2 or larger"] += 1
                 continue
             if row["barangay_of_centroid"] == NO_BARANGAY:
                 dropped["in no barangay"] += 1
