@@ -150,6 +150,7 @@ What this means for the plan: the largest uncertainties are not in the scoring f
   - DPWH and city flood-prone area maps;
   - geocoded news reports;
   - flood extents from Sentinel-1 radar imagery for named events (radar sees through cloud; Typhoon Odette/Rai, December 2021, is one candidate).
+- **Started (2026-10-18):** an independent flood record now exists at barangay-day level: Google Groundsource's news-derived records for Mandaue, 2011–2025 (`data/flood_events/`, 84 flood days, 296 barangay-sized records), paired with hourly ERA5 rain (`data/rain/`). See [findings/2026-10-18-flood-history-thresholds.md](findings/2026-10-18-flood-history-thresholds.md). It can show which barangays were reported flooded on which day, and how much rain came with it; a first barangay-level check finds no correlation between reported flood days and baseline hazard (rho −0.02, wide interval). It can't show depth, time, cause or which node flooded, and it holds reported floods only, so it can't replace a hindcast.
 - **Hindcast**:
   1. Get the event's observed rainfall (PAGASA hourly data, Mactan station).
   2. Run SWMM with it, with the tide at that time once D exists.
@@ -324,7 +325,7 @@ Dependencies:
 |---|---|---|
 | RIDF table and hourly rainfall, Mactan station | PAGASA | D1, C2 |
 | Tide predictions and datum, Cebu / Mactan Channel | NAMRIA | D2 |
-| Flood incident logs with locations and dates | Mandaue City DRRM office | C2 |
+| Flood incident logs with locations and dates | Mandaue City DRRM office. Partly covered: Groundsource news records, barangay-day level (`data/flood_events/`) | C2 |
 | As-built drainage plans; inspection and cleaning records | City Engineering Office, DPWH | G3, E2 |
 | Flap gate and outfall inventory | City Engineering Office | D2 |
 | Gridded population | WorldPop or Meta (open) | B2 |
