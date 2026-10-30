@@ -52,7 +52,9 @@ def simulate(request: SimulationRequest) -> dict[str, Any]:
         links=request.link_overrides(),
         rainfall=rainfall,
     ) as (rpt_path, out_path):
-        summary = build_flooding_summary(rpt_path, out_path, event_hours=event_hours)
+        summary = build_flooding_summary(
+            rpt_path, out_path, event_hours=event_hours, custom_storm=bool(rainfall)
+        )
     return served(summary)
 
 

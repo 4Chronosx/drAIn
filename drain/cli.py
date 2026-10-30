@@ -54,7 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     event_hours = float(rainfall.get("duration_hr") or DEFAULT_EVENT_HOURS)
 
     with run_simulation(rainfall=rainfall) as (rpt_path, out_path):
-        summary = build_flooding_summary(rpt_path, out_path, event_hours=event_hours)
+        summary = build_flooding_summary(
+            rpt_path, out_path, event_hours=event_hours, custom_storm=bool(rainfall)
+        )
 
     metadata = summary["metadata"]
     print(
