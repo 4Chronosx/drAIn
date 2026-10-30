@@ -167,6 +167,9 @@ pip install --require-hashes -r requirements.txt
 
 # ...or, to also get pytest and ruff
 pip install --require-hashes -r requirements-dev.txt
+
+# Once per clone: run ruff before every commit (.githooks/pre-commit)
+git config core.hooksPath .githooks
 ```
 
 Every package, direct or not, is pinned to a version and to the hashes of
