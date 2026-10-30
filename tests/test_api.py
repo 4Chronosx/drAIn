@@ -55,6 +55,10 @@ TEST_SETTINGS = replace(
 AS_A = {"Authorization": "Bearer token-a"}
 AS_B = {"Authorization": "Bearer token-b"}
 
+#: A request that runs a simulation. An empty one is answered from the
+#: baseline, which the per-user limits leave alone.
+A_REAL_RUN = {"rainfall": {"total_precip": 0, "duration_hr": 2}}
+
 
 def make_app(authenticator=None, environ=None, **overrides):
     return create_app(
@@ -243,15 +247,53 @@ class TestPerUserLimits:
         app = make_app(max_jobs_per_user=1)
         try:
             with TestClient(app) as limited:
-                assert limited.post("/simulations", json={}, headers=AS_A).status_code == 202
+                assert (
+                    limited.post("/simulations", json=A_REAL_RUN, headers=AS_A).status_code == 202
+                )
 
-                second = limited.post("/simulations", json={}, headers=AS_A)
+                second = limited.post("/simulations", json=A_REAL_RUN, headers=AS_A)
                 assert second.status_code == 429
                 assert "already have a simulation" in second.json()["detail"]
                 assert int(second.headers["retry-after"]) >= 60
 
                 # Someone else is not held back by it.
-                assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+                assert (
+                    limited.post("/simulations", json=A_REAL_RUN, headers=AS_B).status_code == 202
+                )
+        finally:
+            release.set()
+
+    def test_the_baseline_is_not_held_to_or_counted_in_the_hourly_allowance(self, monkeypatch):
+        """Regression: a request with no changes, answered from the stored
+        baseline, counted like a real run, so repeat visits locked people
+        out of real runs."""
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        app = make_app(max_runs_per_user_per_hour=2)
+        with TestClient(app, headers=AS_A) as limited:
+            # More baseline requests than the hour allows runs.
+            for _ in range(3):
+                poll_url = limited.post("/simulations", json={}).json()["poll_url"]
+                poll_until_finished(limited, poll_url)
+            # Both real runs are still allowed, the third is not.
+            for _ in range(2):
+                poll_url = limited.post("/simulations", json=A_REAL_RUN).json()["poll_url"]
+                poll_until_finished(limited, poll_url)
+            assert limited.post("/simulations", json=A_REAL_RUN).status_code == 429
+            # At the limit, the baseline still comes.
+            accepted = limited.post("/simulations", json={})
+            assert accepted.status_code == 202
+            finished = poll_until_finished(limited, accepted.json()["poll_url"])
+            assert finished["status"] == "succeeded"
+
+    def test_the_baseline_comes_while_a_run_is_going(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = make_app(max_jobs_per_user=1)
+        try:
+            with TestClient(app, headers=AS_A) as limited:
+                assert limited.post("/simulations", json=A_REAL_RUN).status_code == 202
+                assert limited.post("/simulations", json=A_REAL_RUN).status_code == 429
+                assert limited.post("/simulations", json={}).status_code == 202
         finally:
             release.set()
 
@@ -260,13 +302,13 @@ class TestPerUserLimits:
         app = make_app(max_runs_per_user_per_hour=2)
         with TestClient(app, headers=AS_A) as limited:
             for _ in range(2):
-                poll_url = limited.post("/simulations", json={}).json()["poll_url"]
+                poll_url = limited.post("/simulations", json=A_REAL_RUN).json()["poll_url"]
                 poll_until_finished(limited, poll_url)
 
-            refused = limited.post("/simulations", json={})
+            refused = limited.post("/simulations", json=A_REAL_RUN)
             assert refused.status_code == 429
             assert "past hour" in refused.json()["detail"]
-            assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+            assert limited.post("/simulations", json=A_REAL_RUN, headers=AS_B).status_code == 202
 
 
 class TestOverridesAreChecked:

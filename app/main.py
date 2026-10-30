@@ -449,16 +449,24 @@ def create_app(
         override the network can't take, 429 when the caller already has a
         run going or has used their hourly allowance, their address is
         sending too much or has too many runs waiting, or the server is
-        full, and 503 while the server is shutting down.
+        full, and 503 while the server is shutting down. A request with no
+        changes is answered from the baseline and is not held to, or
+        counted against, the caller's own run limits.
         """
         _reject_unknown_ids(request)
+        # The unmodified network is answered from the stored baseline, which
+        # costs nothing, so it is neither held to nor counted against the
+        # caller's own limits (and the run table is not asked how many they
+        # have had). It used to lock people out of real runs.
+        counted = not is_unmodified(request)
         try:
             job = jobs.submit(
                 _work_for(request, config),
                 owner=caller.user_id,
                 request=request.model_dump(exclude_none=True),
                 group=client_ip(http_request.scope, config.trusted_proxy_hops),
-                prior_runs=_recent_runs(repository, caller.user_id, config),
+                prior_runs=_recent_runs(repository, caller.user_id, config) if counted else None,
+                counted=counted,
             )
         except QueueFullError as error:
             raise _queue_full(error) from None
