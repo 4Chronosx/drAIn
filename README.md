@@ -5,7 +5,7 @@
 [![Forks][forks-shield]][forks-url]
 [![Stargazers][stars-shield]][stars-url]
 [![Issues][issues-shield]][issues-url]
-<a href="https://github.com/eliseoalcaraz/drAIn-backend/blob/main/LICENSE">
+<a href="https://github.com/4Chronosx/drAIn/blob/main/LICENSE">
 <img alt="License" src="https://img.shields.io/badge/License-GPL--2.0-blue?style=for-the-badge" />
 </a>
 
@@ -16,7 +16,7 @@
   <br />
   <p align="center">
     <a href="#"><img alt="Status" src="https://img.shields.io/badge/status-Beta-yellow?style=flat&color=yellow" /></a>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white&style=flat" /></a>
     <a href="https://github.com/4Chronosx/drAIn/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/4Chronosx/drAIn?color=coral&logo=git&logoColor=white" /></a>
   </p>
   <a href="https://github.com/4Chronosx/drAIn/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -64,7 +64,7 @@ Urban flood modeling typically requires specialized software and technical exper
 ### Core Framework
 <p align="left">
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white&style=flat" /></a>
-  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white&style=flat" /></a>
+  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white&style=flat" /></a>
   <a href="https://www.uvicorn.org/"><img alt="Uvicorn" src="https://img.shields.io/badge/Uvicorn-2094F3?logo=gunicorn&logoColor=white&style=flat" /></a>
 </p>
 
@@ -107,21 +107,29 @@ drAIn-backend/
 ├── drain/                 # Domain logic — no web framework imports
 │   ├── cli.py             # Run a simulation without the server
 │   ├── exposure.py        # Population around a node, by barangay
+│   ├── flood_history.py   # Reported Mandaue floods 2011-2025, merged into flood days
 │   ├── flooding.py        # Assembles the API payload
 │   ├── geo.py             # UTM reprojection, point-in-polygon
 │   ├── hazard.py          # Flood hazard scoring
 │   ├── network.py         # Node locations, read from the .inp
 │   ├── paths.py           # Locations of the bundled model files
+│   ├── rain_history.py    # Hourly ERA5 rain for Mandaue 2011-2025, from data/rain
 │   ├── rainfall.py        # Design-storm generation
 │   ├── rpt_parser.py      # Parses SWMM .rpt reports
 │   ├── swmm_runner.py     # Runs SWMM
 ├── scripts/               # Analysis, not imported by the server
+│   ├── flood_rain_thresholds.py
+│   ├── sensitivity.py
+│   ├── validate_against_flood_history.py
 │   └── validate_against_reports.py
-├── data/                  # SWMM network and trained model
+├── data/                  # SWMM network, population and flood history
 │   ├── Mandaue_Drainage_Network.inp
-│   ├── Mandaue_Drainage_Network.out
+│   ├── Mandaue_Drainage_Network.out   # Baseline results, pre-computed
 │   ├── Mandaue_Drainage_Network.rpt
 │   ├── mandaue_population.geojson
+│   ├── flood_events/      # Reported floods (Groundsource)
+│   └── rain/              # Hourly ERA5 rain (Open-Meteo)
+├── docs/                  # Science roadmap, key-rotation runbook, findings
 ├── tests/                 # pytest suite
 ├── Python_Notebooks/      # Data preprocessing notebooks
 │   ├── INP_FILE_GENERATOR.ipynb
@@ -144,7 +152,7 @@ Follow these steps to set up and run the **drAIn Backend** locally.
 
 Make sure you have installed:
 
-- [Python](https://www.python.org/) (v3.12+)
+- [Python](https://www.python.org/) 3.12 (the version CI tests and Render runs)
 - [pip](https://pip.pypa.io/) or [conda](https://docs.conda.io/)
 
 The SWMM engine ships with `pyswmm`, so no separate install is needed.
@@ -167,6 +175,9 @@ pip install --require-hashes -r requirements.txt
 
 # ...or, to also get pytest and ruff
 pip install --require-hashes -r requirements-dev.txt
+
+# Once per clone: run ruff before every commit (.githooks/pre-commit)
+git config core.hooksPath .githooks
 ```
 
 Every package, direct or not, is pinned to a version and to the hashes of
@@ -214,7 +225,7 @@ All optional; the defaults cover local development and the known deployments.
 | --- | --- | --- |
 | `ALLOWED_ORIGINS` | the production and localhost origins | Comma-separated CORS allowlist |
 | `ALLOWED_ORIGIN_REGEX` | empty (previews refused) | Extra origins by pattern. To let Vercel previews call the API, set it to `VERCEL_PREVIEW_ORIGIN_REGEX` from `app/config.py` |
-| `LOG_LEVEL` | `INFO` | Root log level |
+| `LOG_LEVEL` | `INFO` | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Anything else, a number included, is an error at start-up |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
 | `QUEUE_SLOTS_RESERVED` | `2` | The last places in the queue are kept for people who have started at most two runs in the past hour (`0` keeps none back) |
@@ -381,16 +392,18 @@ The last 2 of the queue's 8 places are kept for accounts that have started
 at most two runs in the past hour, so a few heavy users can't fill it
 against everyone else. Queued runs start by turns, not in the order they
 arrived: a free worker takes the oldest run of the account whose last start
-is furthest back, one with no start in the last 15 minutes
-(`RESULT_RETENTION_SECONDS`) first, so a newcomer doesn't wait behind every
-run the heavy users have queued. Request bodies over 640 KB get `413`.
+is furthest back, an account with no start still on record first (a
+finished run is forgotten `RESULT_RETENTION_SECONDS`, 15 minutes, after it
+finishes), so a newcomer doesn't wait behind every run the heavy users have
+queued. Request bodies over 640 KB get `413`.
 
 - `POST /simulations` — queue a run. Returns `202` immediately with a job id
-  and where to poll. Returns `429` when the caller already has a run going,
-  has used their hourly allowance, their address is sending too much or
-  already has too many runs waiting, or the server is full; `403` for an
-  account without a confirmed email; `413` for a body over the limit; and
-  `503` while the server is shutting down.
+  and where to poll. Returns `401` without a valid sign-in; `403` for an
+  account without a confirmed email; `413` for a body over the limit; `422`
+  for input the network can't take (below); `429` when the caller already
+  has a run going, has used their hourly allowance, their address is
+  sending too much or already has too many runs waiting, or the server is
+  full; and `503` while the server is shutting down.
 - `GET /simulations/{job_id}` — the job's state, and its result once it
   succeeds. Returns `404` once the result has expired. A finished result
   carries an `ETag`; send it back as `If-None-Match` and the answer is a
@@ -413,7 +426,11 @@ shares one copy of that result in memory, and its row in `simulation_runs`
 stores `{"unmodified_network": true}` in place of the 0.7 MB result, which
 the server fills back in when the run is read. Anything else runs a real
 simulation, in a child process that is killed if it passes
-`MAX_RUNTIME_SECONDS`.
+`MAX_RUNTIME_SECONDS`. A storm shorter than 24 h is still simulated for the
+full 24 h, raining for `duration_hr` and dry after, so flooding after the
+rain stops is counted and its results compare with the baseline; the
+hazard score still takes the storm's own length as the event
+(`metadata.event_hours`).
 
 Invalid input is rejected with `422` before anything is queued: every
 value must be a finite number in a physically possible range (see
@@ -560,7 +577,7 @@ You may redistribute and/or modify it under the terms of the GNU GPL, as publish
 
 ## 🔗 Related Repositories
 
-- [drAIn Frontend](https://github.com/eliseoalcaraz/drAIn) - Next.js web application
+- [drAIn Frontend](https://github.com/kiloumanjaro/drAIn) - Next.js web application
 
 ---
 

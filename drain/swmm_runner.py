@@ -32,7 +32,6 @@ BASE_TIMESERIES_ROWS = 289
 
 DEFAULT_DURATION_HR = 1.0
 DEFAULT_TOTAL_PRECIP_MM = 100.0
-SIMULATION_START_DATE = "01/01/2024"
 
 #: Fields read from each entry of the ``nodes`` request payload.
 NODE_FIELDS = {
@@ -92,18 +91,14 @@ def _apply_link_overrides(sim: Simulation, overrides: Mapping[str, Mapping[str, 
                     setattr(link, attribute, properties[key])
 
 
-def _end_time_tokens(duration_hr: float) -> tuple[str, str]:
-    """Return the ``END_TIME``/``END_DATE`` values for a storm of this length.
-
-    Rounded to the whole minute first and split afterwards. Rounding the
-    minutes on their own turned 1.999 h into "01:60:00".
-    """
-    hours, minutes = divmod(round(duration_hr * 60), 60)
-    return f"{hours:02d}:{minutes:02d}:00", SIMULATION_START_DATE
-
-
 def _build_preconfig(rainfall: Mapping[str, Any]) -> SimulationPreConfig:
-    """Translate a rainfall request into SWMM input-file edits."""
+    """Translate a rainfall request into SWMM input-file edits.
+
+    Only the rain series changes. The run keeps the file's 24 h end: the
+    storm rains for ``duration_hr`` and the rows blanked below mean no rain
+    after it, so flooding after the rain stops is counted and a short storm
+    compares with the 24 h baseline. The run used to end with the rain.
+    """
     config = SimulationPreConfig()
 
     duration_hr = float(rainfall.get("duration_hr", DEFAULT_DURATION_HR))
@@ -113,11 +108,6 @@ def _build_preconfig(rainfall: Mapping[str, Any]) -> SimulationPreConfig:
     logger.info(
         "Generated %d-step storm: %.1f mm over %.2f h", len(series), total_precip, duration_hr
     )
-
-    if duration_hr < 24:
-        end_time, end_date = _end_time_tokens(duration_hr)
-        config.add_update_by_token("OPTIONS", "END_TIME", 1, end_time)
-        config.add_update_by_token("OPTIONS", "END_DATE", 1, end_date)
 
     for row, step in enumerate(series):
         hours = int(step.hours)

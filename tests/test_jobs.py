@@ -164,6 +164,40 @@ class TestPerOwnerLimits:
         finally:
             store.shutdown()
 
+    def test_uncounted_work_is_neither_held_to_nor_counted_in_the_hour(self):
+        """A request answered from the baseline. It used to lock people out
+        of real runs."""
+        store = JobStore(
+            max_workers=1,
+            max_queued=8,
+            retention=timedelta(minutes=5),
+            max_runs_per_owner_per_hour=2,
+        )
+        try:
+            for _ in range(3):
+                wait_for(store.submit(lambda: {}, owner="a", counted=False), store)
+            for _ in range(2):
+                wait_for(store.submit(lambda: {}, owner="a"), store)
+            with pytest.raises(UserLimitError, match="past hour"):
+                store.submit(lambda: {}, owner="a")
+            assert store.submit(lambda: {}, owner="a", counted=False).owner == "a"
+        finally:
+            store.shutdown()
+
+    def test_uncounted_work_is_not_held_to_one_at_a_time(self):
+        release = threading.Event()
+        store = JobStore(
+            max_workers=1, max_queued=8, retention=timedelta(minutes=5), max_jobs_per_owner=1
+        )
+        try:
+            store.submit(hang_until(release), owner="a")
+            with pytest.raises(UserLimitError, match="already have"):
+                store.submit(lambda: {}, owner="a")
+            assert store.submit(lambda: {}, owner="a", counted=False).owner == "a"
+        finally:
+            release.set()
+            store.shutdown()
+
     def test_a_user_limit_is_a_kind_of_full_queue(self):
         # So the API answers it with 429 like any other refusal.
         assert issubclass(UserLimitError, QueueFullError)

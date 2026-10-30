@@ -44,6 +44,30 @@ class TestFlags:
             Settings.from_env()
 
 
+class TestLogLevel:
+    """Regression: ``LOG_LEVEL=verbose`` silently became INFO."""
+
+    @pytest.mark.parametrize("raw", ["warning", "WARNING", " error "])
+    def test_a_level_name_is_accepted_in_any_case(self, monkeypatch, raw):
+        monkeypatch.setenv("LOG_LEVEL", raw)
+        assert Settings.from_env().log_level == raw.strip().upper()
+
+    @pytest.mark.parametrize("raw", ["verbose", "7", "info,debug"])
+    def test_anything_else_is_an_error_naming_the_allowed_values(self, monkeypatch, raw):
+        monkeypatch.setenv("LOG_LEVEL", raw)
+        with pytest.raises(ValueError, match="LOG_LEVEL") as refusal:
+            Settings.from_env()
+        assert "DEBUG, INFO, WARNING, ERROR, CRITICAL" in str(refusal.value)
+
+    @pytest.mark.parametrize("raw", [None, "", "  "])
+    def test_unset_or_empty_is_info(self, monkeypatch, raw):
+        if raw is None:
+            monkeypatch.delenv("LOG_LEVEL", raising=False)
+        else:
+            monkeypatch.setenv("LOG_LEVEL", raw)
+        assert Settings.from_env().log_level == "INFO"
+
+
 class TestRefusingSharedSecretTokens:
     """``REFUSE_HS256_TOKENS`` is turned on last, when a project has moved
     to asymmetric signing keys and its older sessions have expired."""

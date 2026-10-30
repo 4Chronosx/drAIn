@@ -64,7 +64,9 @@ class RunRepository(Protocol):
         """Delete runs created before ``older_than``."""
 
     def count_recent(self, owner: str, since: datetime, limit: int) -> int:
-        """How many runs ``owner`` created since ``since``, counting to ``limit``."""
+        """How many runs ``owner`` created since ``since``, counting to ``limit``.
+        Runs of the unmodified network (stored as :data:`BASELINE_MARKER`)
+        are not counted: they are not held to the hourly allowance."""
 
     def trim_owner(self, owner: str, keep: int) -> None:
         """Delete ``owner``'s finished runs beyond their newest ``keep``."""
@@ -238,6 +240,12 @@ class SupabaseRunRepository:
                 "select": "id",
                 "user_id": f"eq.{owner}",
                 "created_at": f"gte.{since.isoformat()}",
+                # Not the baseline's rows, whose result is BASELINE_MARKER.
+                # shortcut: a baseline run still queued (result null) counts
+                # until its result is written moments later, and baseline
+                # rows still count towards the per-owner trim; revisit if the
+                # table's count ever misleads after a restart.
+                "result->>unmodified_network": "is.null",
                 "limit": str(limit),
             }
         )

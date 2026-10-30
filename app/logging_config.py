@@ -13,9 +13,18 @@ import sys
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
+#: The handler the last call installed, replaced by the next one.
+_handler: logging.Handler | None = None
+
 
 def configure_logging(level: str = "INFO") -> None:
-    """Install a stdout handler that can always encode what it is given."""
+    """Install a stdout handler that can always encode what it is given.
+
+    Safe to call again: it replaces the handler it installed before and
+    leaves any other root handler (pytest's capture, say) alone. It used
+    to clear them all.
+    """
+    global _handler
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
 
@@ -26,6 +35,8 @@ def configure_logging(level: str = "INFO") -> None:
             reconfigure(errors="backslashreplace")
 
     root = logging.getLogger()
-    root.handlers.clear()
+    if _handler is not None:
+        root.removeHandler(_handler)
     root.addHandler(handler)
+    _handler = handler
     root.setLevel(getattr(logging, level, logging.INFO))

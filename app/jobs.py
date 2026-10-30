@@ -194,6 +194,7 @@ class JobStore:
         request: dict[str, Any] | None = None,
         group: str | None = None,
         prior_runs: int | None = None,
+        counted: bool = True,
     ) -> SimulationJob:
         """Queue a simulation, or raise :class:`QueueFullError`.
 
@@ -205,8 +206,13 @@ class JobStore:
         ``prior_runs`` is how many runs the owner started in the past hour
         by an outside count (the run table). This process forgets its own
         count when it restarts, so the larger of the two is used.
+
+        With ``counted`` off, the work is neither held to the owner's
+        allowances nor counted towards them: a request answered from the
+        stored baseline costs the server nothing, and used to lock people
+        out of real runs.
         """
-        _, accepted = self._enqueue(work, owner, request, group, prior_runs)
+        _, accepted = self._enqueue(work, owner, request, group, prior_runs, counted)
         return accepted
 
     def get(self, job_id: str) -> SimulationJob | None:
@@ -249,13 +255,14 @@ class JobStore:
         request: dict[str, Any] | None = None,
         group: str | None = None,
         prior_runs: int | None = None,
+        counted: bool = True,
     ) -> tuple[_Entry, SimulationJob]:
         """Queue work. Returns its entry and a snapshot of the job as accepted."""
         with self._lock:
             if self._closed:
                 raise JobStoreClosedError("The simulation service is shutting down.")
             self._drop_expired()
-            if owner is not None:
+            if owner is not None and counted:
                 self._check_owner_allowance(owner, prior_runs or 0)
             if group is not None:
                 self._check_group_allowance(group)
@@ -264,6 +271,7 @@ class JobStore:
                 raise QueueFullError(f"{outstanding} simulations are already queued or running.")
             if (
                 owner is not None
+                and counted
                 and outstanding >= self._max_queued - self._reserved_slots
                 and self._runs_this_hour(owner, prior_runs or 0) > LIGHT_USE_RUNS
             ):
@@ -276,7 +284,7 @@ class JobStore:
                 job=SimulationJob(id=str(uuid.uuid4()), owner=owner, request=request),
                 work=work,
             )
-            if owner is not None:
+            if owner is not None and counted:
                 self._recent_runs.setdefault(owner, deque()).append(entry.job.created_at)
             self._entries[entry.job.id] = entry
             if group is not None:
