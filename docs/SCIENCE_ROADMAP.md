@@ -61,7 +61,7 @@ Every number below comes from the shipped files in this repository.
 
 **Exposure** (`drain/exposure.py`).
 - The score is the density of the barangay a node falls in, divided by the densest barangay's.
-- A node outside every mapped barangay scores 0.5.
+- A node outside every mapped barangay takes the nearest one within 250 m (`Exposure_Basis` "nearest"); further out its exposure and risk are null, not a guess (B1, PR #1).
 
 **Stored scenarios.** The `flood_results` table behind the simulation page's per-return-period tables was rated by the superseded k-means model: exactly four distinct scores, one per cluster. Live runs use the hazard score, so the two tables can't be compared node for node.
 
@@ -288,8 +288,8 @@ Live results carry `metadata.model_info`, built from the scorer's own constants.
 **Phase 1, weeks 1–3. Make the uncertainty visible (no new data).**
 - A1: sensitivity and rank bands. Sensitivity done 2026-09-29 (`scripts/sensitivity.py`, `docs/sensitivity-2026-09-29.md`): median Kendall τ 0.963, top-50 overlap 0.923, 45 of the top 50 hold in 90%+ of 2,000 draws. Rank bands in the API payload still to do.
 - C1: within-barangay validation of hazard, with confirmed reports only.
-- B1: no invented exposure.
-- G1: version stamp.
+- B1: no invented exposure. Done (PR #1): the nearest barangay within 250 m, else `Exposure_Score: null` and `Exposure_Basis` "unknown"; the payload counts each basis.
+- G1: version stamp. Done (PR #1): `model_info.network_sha256` in every result, stored as `simulation_runs.model_version`.
 - G4: investigate the 89 inconsistent nodes. Done 2026-09-29: SWMM reporting resolution (1-minute report step, 10-second routing), not our parsing; all 89 rate Low. See `docs/findings/2026-09-29-rpt-vs-out-flooding.md`.
 - F1: accurate claims.
 - Rename or relabel `init_flow` (it sets the flow limit).
