@@ -54,7 +54,8 @@ def test_a_result_of_the_shipped_series_says_so():
 
 def test_a_result_of_a_custom_storm_says_it_is_a_triangle():
     assert _storm_line(custom_storm=True) == (
-        "Real storm timing: the storm is an idealised triangle of the given depth and duration."
+        "Real storm timing: the storm is an idealised triangle of the given depth and "
+        "duration, simulated to 24 h so drain-down is counted."
     )
 
 

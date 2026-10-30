@@ -53,7 +53,10 @@ def network_sha256(inp_path: Path = BASE_INP) -> str:
 #: The rain series shipped in the network file, which every run without a
 #: custom storm uses: 24 hours, 266 mm in all.
 SHIPPED_STORM = "the shipped 24 h rain series (TS_Rain, 266 mm), not an observed event"
-CUSTOM_STORM = "an idealised triangle of the given depth and duration"
+CUSTOM_STORM = (
+    "an idealised triangle of the given depth and duration, "
+    "simulated to 24 h so drain-down is counted"
+)
 
 
 def model_info(custom_storm: bool = False) -> dict[str, Any]:

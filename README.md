@@ -416,7 +416,11 @@ shares one copy of that result in memory, and its row in `simulation_runs`
 stores `{"unmodified_network": true}` in place of the 0.7 MB result, which
 the server fills back in when the run is read. Anything else runs a real
 simulation, in a child process that is killed if it passes
-`MAX_RUNTIME_SECONDS`.
+`MAX_RUNTIME_SECONDS`. A storm shorter than 24 h is still simulated for the
+full 24 h, raining for `duration_hr` and dry after, so flooding after the
+rain stops is counted and its results compare with the baseline; the
+hazard score still takes the storm's own length as the event
+(`metadata.event_hours`).
 
 Invalid input is rejected with `422` before anything is queued: every
 value must be a finite number in a physically possible range (see
