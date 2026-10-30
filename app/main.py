@@ -329,6 +329,10 @@ def create_app(
     """Build the application. Kept separate from the module-level instance so
     tests can construct an app with their own settings, sign-in check, run
     record and environment (read at start-up for where the server runs)."""
+    # First: the warnings below used to go out through logging's last-resort
+    # handler, bare and regardless of LOG_LEVEL, because logging was set up
+    # in the lifespan.
+    configure_logging(config.log_level)
     auth = authenticator if authenticator is not None else _build_authenticator(config)
     repository = runs if runs is not None else _build_run_repository(config)
     recorder = (
@@ -345,8 +349,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Set up logging, and settle runs a restart cut short."""
-        configure_logging(config.log_level)
+        """Refuse an unsafe deployment, and settle runs a restart cut short."""
         _refuse_insecure_deployment(config, environ)
         isolation.sweep_stale_directories(older_than=config.max_runtime_seconds)
         if repository is not None:

@@ -217,7 +217,7 @@ All optional; the defaults cover local development and the known deployments.
 | --- | --- | --- |
 | `ALLOWED_ORIGINS` | the production and localhost origins | Comma-separated CORS allowlist |
 | `ALLOWED_ORIGIN_REGEX` | empty (previews refused) | Extra origins by pattern. To let Vercel previews call the API, set it to `VERCEL_PREVIEW_ORIGIN_REGEX` from `app/config.py` |
-| `LOG_LEVEL` | `INFO` | Root log level |
+| `LOG_LEVEL` | `INFO` | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Anything else, a number included, is an error at start-up |
 | `MAX_CONCURRENT_SIMULATIONS` | `1` | How many SWMM runs may execute at once |
 | `MAX_QUEUED_SIMULATIONS` | `8` | Outstanding jobs allowed before new ones get `429` |
 | `QUEUE_SLOTS_RESERVED` | `2` | The last places in the queue are kept for people who have started at most two runs in the past hour (`0` keeps none back) |

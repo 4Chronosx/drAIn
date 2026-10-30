@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app import polling as app_polling
 from app.auth import AccountRefusedError, AuthUnavailableError, Caller, SupabaseAuthenticator
 from app.config import VERCEL_PREVIEW_ORIGIN_REGEX, settings
+from app.logging_config import LOG_FORMAT
 from app.main import _build_authenticator, create_app
 from app.schemas import MAX_NODE_OVERRIDES, SimulationRequest
 from app.simulation import baseline_result, is_baseline
@@ -222,12 +223,7 @@ class TestSignIn:
         # Every request during an outage lands here; a traceback for each
         # buried everything else in the log.
         with TestClient(make_app(BrokenAuthenticator())) as outage:
-            # Start-up reconfigures logging, so listen only once it has.
-            logging.getLogger("app.main").addHandler(caplog.handler)
-            try:
-                outage.post("/simulations", json={}, headers=AS_A)
-            finally:
-                logging.getLogger("app.main").removeHandler(caplog.handler)
+            outage.post("/simulations", json={}, headers=AS_A)
         records = [record for record in caplog.records if "sign-in" in record.getMessage()]
         assert [record.levelno for record in records] == [logging.WARNING]
         assert "Supabase is down" in records[0].getMessage()
@@ -798,6 +794,33 @@ DEPLOYED = {
     "submit_rate_per_minute": 6,
     "poll_rate_per_minute": 120,
 }
+
+
+class TestStartUpLogging:
+    """Regression: the warnings logged while the app was built ran before
+    the lifespan configured logging, so they went out through logging's
+    last-resort handler, bare and whatever LOG_LEVEL said."""
+
+    @staticmethod
+    def warned_about_auth(caplog):
+        return [r for r in caplog.records if "REQUIRE_AUTH is off" in r.getMessage()]
+
+    def test_the_log_level_applies_to_the_first_warning(self, caplog):
+        # No authenticator given, so the app builds one and warns.
+        create_app(replace(TEST_SETTINGS, require_auth=False, log_level="ERROR"), environ={})
+        assert self.warned_about_auth(caplog) == []
+        create_app(replace(TEST_SETTINGS, require_auth=False, log_level="WARNING"), environ={})
+        assert len(self.warned_about_auth(caplog)) == 1
+
+    def test_building_two_apps_leaves_one_handler_of_ours(self):
+        make_app()
+        make_app()
+        ours = [
+            h
+            for h in logging.getLogger().handlers
+            if h.formatter is not None and h.formatter._fmt == LOG_FORMAT
+        ]
+        assert len(ours) == 1
 
 
 class TestBuildingTheAuthenticator:
