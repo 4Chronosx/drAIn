@@ -594,13 +594,12 @@ class TestTheRunTableIsDown:
         # traceback for each buried everything else in the log.
         app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=self.Unreadable())
         with TestClient(app, headers=AS_A) as client:
-            # Start-up reconfigures logging, so listen only once it has.
-            logging.getLogger("app.main").addHandler(caplog.handler)
-            try:
-                client.get(f"/simulations/{JOB_ID}")
-            finally:
-                logging.getLogger("app.main").removeHandler(caplog.handler)
-        records = [record for record in caplog.records if JOB_ID in record.getMessage()]
+            client.get(f"/simulations/{JOB_ID}")
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "app.main" and JOB_ID in record.getMessage()
+        ]
         assert [record.levelno for record in records] == [logging.WARNING]
         assert "timed out" in records[0].getMessage()
         assert records[0].exc_info is None
