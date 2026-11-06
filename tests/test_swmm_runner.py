@@ -5,40 +5,22 @@ from __future__ import annotations
 import pytest
 
 from drain import swmm_runner
-from drain.swmm_runner import (
-    BASE_TIMESERIES_ROWS,
-    RAIN_TIMESERIES_NAME,
-    SIMULATION_START_DATE,
-    _build_preconfig,
-    _end_time_tokens,
-)
+from drain.paths import BASE_INP
+from drain.swmm_runner import BASE_TIMESERIES_ROWS, RAIN_TIMESERIES_NAME, _build_preconfig
 
 
-class TestEndTime:
-    @pytest.mark.parametrize(
-        ("duration_hr", "expected"),
-        [
-            (1.0, "01:00:00"),
-            (1.5, "01:30:00"),
-            (0.25, "00:15:00"),
-            # Regression: rounding the minutes on their own turned a duration
-            # just under a whole hour into "00:60:00" and "01:60:00".
-            (0.999, "01:00:00"),
-            (1.999, "02:00:00"),
-            (24.0, "24:00:00"),
-        ],
-    )
-    def test_the_end_time_is_a_valid_clock_time(self, duration_hr, expected):
-        assert _end_time_tokens(duration_hr) == (expected, SIMULATION_START_DATE)
-
-    def test_minutes_never_reach_sixty(self):
-        for step in range(1, 24000):
-            duration_hr = step / 1000
-            end_time, _ = _end_time_tokens(duration_hr)
-            hours, minutes, seconds = (int(part) for part in end_time.split(":"))
-            assert 0 <= minutes < 60, (duration_hr, end_time)
-            assert seconds == 0
-            assert hours * 60 + minutes == round(duration_hr * 60)
+def shipped_options():
+    """The [OPTIONS] of the network file, by name."""
+    options = {}
+    in_options = False
+    for line in BASE_INP.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("["):
+            in_options = line.strip().upper() == "[OPTIONS]"
+            continue
+        parts = line.split()
+        if in_options and len(parts) >= 2 and not parts[0].startswith(";"):
+            options[parts[0]] = parts[1]
+    return options
 
 
 class RecordingPreConfig:
@@ -81,14 +63,26 @@ class TestBuildPreconfig:
         assert max(generated) < min(cleared)
         assert sorted(generated + cleared) == list(range(BASE_TIMESERIES_ROWS))
 
-    def test_a_short_storm_sets_the_end_time(self, recorded):
-        updates = recorded({"total_precip": 50, "duration_hr": 1.5})
-        assert ("OPTIONS", "END_TIME", 1, "01:30:00", 0) in updates
-        assert ("OPTIONS", "END_DATE", 1, SIMULATION_START_DATE, 0) in updates
-
-    def test_a_full_day_storm_keeps_the_shipped_end_time(self, recorded):
-        updates = recorded({"total_precip": 50, "duration_hr": 24})
+    @pytest.mark.parametrize("duration_hr", [1, 1.5, 24])
+    def test_every_storm_keeps_the_files_24_hour_end(self, recorded, duration_hr):
+        """A short storm used to end the run with the rain, so flooding after
+        it was never counted and its results did not compare with the 24 h
+        baseline."""
+        updates = recorded({"total_precip": 50, "duration_hr": duration_hr})
         assert not [u for u in updates if u[0] == "OPTIONS"]
+
+    def test_the_files_end_is_24_hours_after_its_start(self):
+        options = shipped_options()
+        assert (options["START_DATE"], options["START_TIME"]) == ("01/01/2024", "00:00:00")
+        assert (options["END_DATE"], options["END_TIME"]) == ("01/02/2024", "00:00:00")
+
+    def test_a_one_hour_storm_is_dry_from_hour_one_to_the_end(self, recorded):
+        rows = rain_rows(recorded({"total_precip": 50, "duration_hr": 1}))
+        generated = {row: values for row, values in rows.items() if values.get(1)}
+        last = generated[max(generated)]
+        assert (last[1], last[2]) == ("01:00", "0.00")
+        for row in range(max(generated) + 1, BASE_TIMESERIES_ROWS):
+            assert rows[row] == {0: "", 1: "", 2: ""}
 
 
 class TestLinkOverrideMatching:

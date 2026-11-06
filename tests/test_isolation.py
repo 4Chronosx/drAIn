@@ -138,7 +138,9 @@ def isolated_app():
 
 def test_a_real_simulation_runs_in_a_child_process(isolated_app):
     with TestClient(isolated_app, headers=AS_A) as client:
-        payload = {"rainfall": {"total_precip": 20, "duration_hr": 1}}
+        # Dry: every custom storm is simulated to 24 h, and a wet one takes
+        # most of a minute. The child process is the point here.
+        payload = {"rainfall": {"total_precip": 0, "duration_hr": 1}}
         poll_url = client.post("/simulations", json=payload).json()["poll_url"]
         finished = poll_until_finished(client, poll_url, timeout=120)
     assert finished["status"] == "succeeded", finished["error"]

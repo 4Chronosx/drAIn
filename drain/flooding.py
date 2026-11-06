@@ -52,8 +52,12 @@ def build_flooding_summary(
     rpt_path: Path,
     out_path: Path,
     event_hours: float = DEFAULT_EVENT_HOURS,
+    custom_storm: bool = False,
 ) -> dict[str, Any]:
     """Build the full node flooding payload for a completed simulation.
+
+    ``custom_storm`` is whether the run used a storm the caller specified
+    rather than the shipped rain series; ``model_info`` says which.
 
     Every node in the ``.out`` file is present in the result; those that did
     not flood carry zeroes. The payload exposes the same data twice -- as a
@@ -162,7 +166,7 @@ def build_flooding_summary(
                 for basis in ("inside", "nearest", "unknown")
             },
             # What the ratings can and cannot claim; shown where they are read.
-            "model_info": model_info(),
+            "model_info": model_info(custom_storm=custom_storm),
             "scoring": {
                 "hazard": "Vulnerability_Score: 0-1, from flood volume, duration and peak rate.",
                 "exposure": (

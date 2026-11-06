@@ -1,3 +1,9 @@
+[project]
+name = "drain-backend"
+# Locked to 3.12: the version CI tests and Render runs. Nothing builds this
+# package; the table is here for the version pin.
+requires-python = ">=3.12,<3.13"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

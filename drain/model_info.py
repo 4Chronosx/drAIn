@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from drain import hazard
+from drain.exposure import NEAREST_WITHIN_M
 from drain.paths import BASE_INP
 
 _DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -49,8 +50,21 @@ def network_sha256(inp_path: Path = BASE_INP) -> str:
     return digest.hexdigest()
 
 
-def model_info() -> dict[str, Any]:
-    """The model's provenance and limits, in a form the app can render."""
+#: The rain series shipped in the network file, which every run without a
+#: custom storm uses: 24 hours, 266 mm in all.
+SHIPPED_STORM = "the shipped 24 h rain series (TS_Rain, 266 mm), not an observed event"
+CUSTOM_STORM = (
+    "an idealised triangle of the given depth and duration, "
+    "simulated to 24 h so drain-down is counted"
+)
+
+
+def model_info(custom_storm: bool = False) -> dict[str, Any]:
+    """The model's provenance and limits, in a form the app can render.
+
+    ``custom_storm`` says whether the result came from a storm the caller
+    specified (depth and duration) rather than the shipped rain series.
+    """
     return {
         "network": "Mandaue City drainage network (SWMM)",
         "network_built_on": network_built_on(),
@@ -73,12 +87,16 @@ def model_info() -> dict[str, Any]:
             # not the result of a damage study.
             "provisional": True,
         },
-        "exposure": "Population density of the barangay a node is in, not people in the flood.",
+        "exposure": (
+            "Population density of the barangay a node is in, not people in the flood. "
+            f"A node outside every barangay takes the nearest one within {NEAREST_WITHIN_M:.0f} m; "
+            "further out it is unmapped and gets no exposure or risk score."
+        ),
         "not_modelled": [
             "Blocked or silted drains: every pipe is modelled clean.",
             "High tide or storm surge at the outfalls: they discharge freely.",
             "Ground already wet from earlier rain.",
-            "Real storm timing: the storm is an idealised triangle.",
+            f"Real storm timing: the storm is {CUSTOM_STORM if custom_storm else SHIPPED_STORM}.",
             "Changes to the city since the network was built.",
         ],
     }

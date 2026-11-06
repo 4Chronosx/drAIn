@@ -21,7 +21,7 @@ _STRICT = ConfigDict(allow_inf_nan=False, extra="forbid")
 ComponentId = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
 #: The most overrides one request may carry. The network has 1,413 nodes and
-#: 1,570 conduits, so a request touching every one fits; a bigger one is
+#: 1,428 conduits, so a request touching every one fits; a bigger one is
 #: refused before its entries are validated one by one.
 MAX_NODE_OVERRIDES = 2_000
 MAX_LINK_OVERRIDES = 2_000

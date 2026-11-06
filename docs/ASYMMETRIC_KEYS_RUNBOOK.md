@@ -32,7 +32,7 @@ echo '<first part>' | base64 -d
 
 ## Stage 0: prerequisites
 
-1. This branch (`asymmetric-keys`) and backend PR #5 are merged to `main` and Render shows the deploy as live.
+1. This branch (`asymmetric-keys`, backend PR #6) is merged to `main` and Render shows the deploy as live.
 2. `curl -s https://<backend>/health` returns `{"status":"ok"}` with HTTP 200.
 3. In Render > Environment, `REFUSE_HS256_TOKENS` is **unset** (or `false`). If it is `true` during stages 1 to 3, this backend refuses every signed-in user from the moment the new key is listed.
 4. In Supabase > Edge Functions > `geocodeWorker`, confirm "Verify JWT" is off (it was deployed with `--no-verify-jwt`). The docs warn that functions with it on may break at rotation, and contradict themselves on whether they do.

@@ -78,6 +78,24 @@ def _env_flag(name: str, default: bool, environ: Mapping[str, str] = os.environ)
     )
 
 
+#: The names LOG_LEVEL takes. Numbers are not accepted.
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _env_log_level(name: str, default: str, environ: Mapping[str, str] = os.environ) -> str:
+    """A log level by name from the environment; unset or empty means ``default``.
+
+    Anything else is an error. ``verbose`` used to become INFO silently.
+    """
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().upper()
+    if value in LOG_LEVELS:
+        return value
+    raise ValueError(f"{name} must be one of {', '.join(LOG_LEVELS)}, not {raw.strip()!r}.")
+
+
 @dataclass(frozen=True)
 class Settings:
     """Settings for one process, resolved once at import time."""
@@ -207,7 +225,7 @@ class Settings:
         return cls(
             allowed_origins=_env_list("ALLOWED_ORIGINS") or DEFAULT_ALLOWED_ORIGINS,
             origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX", DEFAULT_ORIGIN_REGEX),
-            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            log_level=_env_log_level("LOG_LEVEL", "INFO"),
             max_concurrent_simulations=int(os.getenv("MAX_CONCURRENT_SIMULATIONS", "1")),
             max_queued_simulations=int(os.getenv("MAX_QUEUED_SIMULATIONS", "8")),
             queue_slots_reserved=int(os.getenv("QUEUE_SLOTS_RESERVED", "2")),

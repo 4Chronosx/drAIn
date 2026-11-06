@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app import polling as app_polling
 from app.auth import AccountRefusedError, AuthUnavailableError, Caller, SupabaseAuthenticator
 from app.config import VERCEL_PREVIEW_ORIGIN_REGEX, settings
+from app.logging_config import LOG_FORMAT
 from app.main import _build_authenticator, create_app
 from app.schemas import MAX_NODE_OVERRIDES, SimulationRequest
 from app.simulation import baseline_result, is_baseline
@@ -53,6 +54,10 @@ TEST_SETTINGS = replace(
 
 AS_A = {"Authorization": "Bearer token-a"}
 AS_B = {"Authorization": "Bearer token-b"}
+
+#: A request that runs a simulation. An empty one is answered from the
+#: baseline, which the per-user limits leave alone.
+A_REAL_RUN = {"rainfall": {"total_precip": 0, "duration_hr": 2}}
 
 
 def make_app(authenticator=None, environ=None, **overrides):
@@ -222,12 +227,7 @@ class TestSignIn:
         # Every request during an outage lands here; a traceback for each
         # buried everything else in the log.
         with TestClient(make_app(BrokenAuthenticator())) as outage:
-            # Start-up reconfigures logging, so listen only once it has.
-            logging.getLogger("app.main").addHandler(caplog.handler)
-            try:
-                outage.post("/simulations", json={}, headers=AS_A)
-            finally:
-                logging.getLogger("app.main").removeHandler(caplog.handler)
+            outage.post("/simulations", json={}, headers=AS_A)
         records = [record for record in caplog.records if "sign-in" in record.getMessage()]
         assert [record.levelno for record in records] == [logging.WARNING]
         assert "Supabase is down" in records[0].getMessage()
@@ -247,15 +247,53 @@ class TestPerUserLimits:
         app = make_app(max_jobs_per_user=1)
         try:
             with TestClient(app) as limited:
-                assert limited.post("/simulations", json={}, headers=AS_A).status_code == 202
+                assert (
+                    limited.post("/simulations", json=A_REAL_RUN, headers=AS_A).status_code == 202
+                )
 
-                second = limited.post("/simulations", json={}, headers=AS_A)
+                second = limited.post("/simulations", json=A_REAL_RUN, headers=AS_A)
                 assert second.status_code == 429
                 assert "already have a simulation" in second.json()["detail"]
                 assert int(second.headers["retry-after"]) >= 60
 
                 # Someone else is not held back by it.
-                assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+                assert (
+                    limited.post("/simulations", json=A_REAL_RUN, headers=AS_B).status_code == 202
+                )
+        finally:
+            release.set()
+
+    def test_the_baseline_is_not_held_to_or_counted_in_the_hourly_allowance(self, monkeypatch):
+        """Regression: a request with no changes, answered from the stored
+        baseline, counted like a real run, so repeat visits locked people
+        out of real runs."""
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        app = make_app(max_runs_per_user_per_hour=2)
+        with TestClient(app, headers=AS_A) as limited:
+            # More baseline requests than the hour allows runs.
+            for _ in range(3):
+                poll_url = limited.post("/simulations", json={}).json()["poll_url"]
+                poll_until_finished(limited, poll_url)
+            # Both real runs are still allowed, the third is not.
+            for _ in range(2):
+                poll_url = limited.post("/simulations", json=A_REAL_RUN).json()["poll_url"]
+                poll_until_finished(limited, poll_url)
+            assert limited.post("/simulations", json=A_REAL_RUN).status_code == 429
+            # At the limit, the baseline still comes.
+            accepted = limited.post("/simulations", json={})
+            assert accepted.status_code == 202
+            finished = poll_until_finished(limited, accepted.json()["poll_url"])
+            assert finished["status"] == "succeeded"
+
+    def test_the_baseline_comes_while_a_run_is_going(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr("app.main._simulate", lambda request: (release.wait(10), {})[1])
+        app = make_app(max_jobs_per_user=1)
+        try:
+            with TestClient(app, headers=AS_A) as limited:
+                assert limited.post("/simulations", json=A_REAL_RUN).status_code == 202
+                assert limited.post("/simulations", json=A_REAL_RUN).status_code == 429
+                assert limited.post("/simulations", json={}).status_code == 202
         finally:
             release.set()
 
@@ -264,13 +302,13 @@ class TestPerUserLimits:
         app = make_app(max_runs_per_user_per_hour=2)
         with TestClient(app, headers=AS_A) as limited:
             for _ in range(2):
-                poll_url = limited.post("/simulations", json={}).json()["poll_url"]
+                poll_url = limited.post("/simulations", json=A_REAL_RUN).json()["poll_url"]
                 poll_until_finished(limited, poll_url)
 
-            refused = limited.post("/simulations", json={})
+            refused = limited.post("/simulations", json=A_REAL_RUN)
             assert refused.status_code == 429
             assert "past hour" in refused.json()["detail"]
-            assert limited.post("/simulations", json={}, headers=AS_B).status_code == 202
+            assert limited.post("/simulations", json=A_REAL_RUN, headers=AS_B).status_code == 202
 
 
 class TestOverridesAreChecked:
@@ -798,6 +836,33 @@ DEPLOYED = {
     "submit_rate_per_minute": 6,
     "poll_rate_per_minute": 120,
 }
+
+
+class TestStartUpLogging:
+    """Regression: the warnings logged while the app was built ran before
+    the lifespan configured logging, so they went out through logging's
+    last-resort handler, bare and whatever LOG_LEVEL said."""
+
+    @staticmethod
+    def warned_about_auth(caplog):
+        return [r for r in caplog.records if "REQUIRE_AUTH is off" in r.getMessage()]
+
+    def test_the_log_level_applies_to_the_first_warning(self, caplog):
+        # No authenticator given, so the app builds one and warns.
+        create_app(replace(TEST_SETTINGS, require_auth=False, log_level="ERROR"), environ={})
+        assert self.warned_about_auth(caplog) == []
+        create_app(replace(TEST_SETTINGS, require_auth=False, log_level="WARNING"), environ={})
+        assert len(self.warned_about_auth(caplog)) == 1
+
+    def test_building_two_apps_leaves_one_handler_of_ours(self):
+        make_app()
+        make_app()
+        ours = [
+            h
+            for h in logging.getLogger().handlers
+            if h.formatter is not None and h.formatter._fmt == LOG_FORMAT
+        ]
+        assert len(ours) == 1
 
 
 class TestBuildingTheAuthenticator:

@@ -15,9 +15,10 @@ from fastapi.testclient import TestClient
 from app.jobs import JobStatus, JobStore, SimulationJob
 from app.main import RESTARTED_MESSAGE, create_app
 from app.runs import RunRecorder, RunStoreError, SupabaseRunRepository
-from app.simulation import BASELINE_MARKER, baseline_result
+from app.simulation import BASELINE_MARKER, baseline_result, is_baseline
 from drain.model_info import network_sha256
 from tests.test_api import (
+    A_REAL_RUN,
     AS_A,
     AS_B,
     TEST_SETTINGS,
@@ -197,7 +198,10 @@ class MemoryRepository:
         self.pruned.append(older_than)
 
     def count_recent(self, owner, since, limit):
-        recent = [job for job in self.rows.values() if job.owner == owner]
+        # Not the baseline's runs, as the table query leaves them out.
+        recent = [
+            job for job in self.rows.values() if job.owner == owner and not is_baseline(job.result)
+        ]
         return min(limit, len([job for job in recent if job.created_at >= since]))
 
     def trim_owner(self, owner, keep):
@@ -491,6 +495,14 @@ class TestRecentRunCount:
         assert repository(fake).count_recent("local-dev", datetime.now(UTC), 10) == 0
         assert fake.calls == []
 
+    def test_it_leaves_out_runs_of_the_unmodified_network(self):
+        """Their rows hold BASELINE_MARKER; the query asks for rows without
+        its key, which is also every row whose result is still null."""
+        fake = FakePostgrest(200, b"[]")
+        repository(fake).count_recent(USER_A, datetime(2026, 9, 1, tzinfo=UTC), limit=10)
+        _, url, _, _ = fake.calls[0]
+        assert "result-%3E%3Eunmodified_network=is.null" in url
+
 
 class TestLimitsSurviveRestarts:
     """Regression: the hourly allowance was counted in memory only, so every
@@ -510,10 +522,21 @@ class TestLimitsSurviveRestarts:
             job_id = f"11111111-1111-4111-8111-00000000000{n}"
             memory.rows[job_id] = finished_job(id=job_id, created_at=datetime.now(UTC))
         with TestClient(self.make_app(memory, max_runs_per_user_per_hour=2)) as client:
-            refused = client.post("/simulations", json={}, headers=AS_A)
+            refused = client.post("/simulations", json=A_REAL_RUN, headers=AS_A)
             assert refused.status_code == 429
             assert "past hour" in refused.json()["detail"]
             assert client.post("/simulations", json={}, headers=AS_B).status_code == 202
+
+    def test_baseline_runs_recorded_before_a_restart_do_not(self, monkeypatch):
+        monkeypatch.setattr("app.main._simulate", lambda request: {})
+        memory = MemoryRepository()
+        for n in range(2):
+            job_id = f"11111111-1111-4111-8111-00000000000{n}"
+            memory.rows[job_id] = finished_job(
+                id=job_id, created_at=datetime.now(UTC), result=baseline_result()
+            )
+        with TestClient(self.make_app(memory, max_runs_per_user_per_hour=2)) as client:
+            assert client.post("/simulations", json=A_REAL_RUN, headers=AS_A).status_code == 202
 
     def test_runs_older_than_an_hour_do_not(self, monkeypatch):
         monkeypatch.setattr("app.main._simulate", lambda request: {})
@@ -594,13 +617,12 @@ class TestTheRunTableIsDown:
         # traceback for each buried everything else in the log.
         app = create_app(TEST_SETTINGS, authenticator=FakeAuthByUuid(), runs=self.Unreadable())
         with TestClient(app, headers=AS_A) as client:
-            # Start-up reconfigures logging, so listen only once it has.
-            logging.getLogger("app.main").addHandler(caplog.handler)
-            try:
-                client.get(f"/simulations/{JOB_ID}")
-            finally:
-                logging.getLogger("app.main").removeHandler(caplog.handler)
-        records = [record for record in caplog.records if JOB_ID in record.getMessage()]
+            client.get(f"/simulations/{JOB_ID}")
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "app.main" and JOB_ID in record.getMessage()
+        ]
         assert [record.levelno for record in records] == [logging.WARNING]
         assert "timed out" in records[0].getMessage()
         assert records[0].exc_info is None
