@@ -26,11 +26,12 @@ since they can't be told apart.
 
 Usage::
 
-    SUPABASE_URL=... SUPABASE_KEY=... python -m scripts.validate_against_reports
+    SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... python -m scripts.validate_against_reports
 
 Use the service-role key to count distinct reporters: signed-out (anon)
 keys can't read reports.user_id, and the script then treats every report
-as coming from one unknown person per component.
+as coming from one unknown person per component. ``SUPABASE_KEY`` is read
+when ``SUPABASE_SERVICE_ROLE_KEY`` is not set.
 
 Reads nothing but the reports table, and writes nothing back. Reports
 agency staff rejected (spam, duplicates, not a drainage problem) are left
@@ -319,7 +320,10 @@ def compare_against_volume_baseline(matched: set[str], nodes: dict[str, dict]) -
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--supabase-url", default=os.getenv("SUPABASE_URL"))
-    parser.add_argument("--supabase-key", default=os.getenv("SUPABASE_KEY"))
+    parser.add_argument(
+        "--supabase-key",
+        default=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY"),
+    )
     parser.add_argument("--log-level", default="WARNING")
     parser.add_argument(
         "--all-reports",
@@ -343,7 +347,10 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(args.log_level.upper())
 
     if not args.supabase_url or not args.supabase_key:
-        parser.error("Set SUPABASE_URL and SUPABASE_KEY, or pass --supabase-url/--supabase-key.")
+        parser.error(
+            "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY), "
+            "or pass --supabase-url/--supabase-key."
+        )
 
     try:
         reports = fetch_reports(args.supabase_url, args.supabase_key)

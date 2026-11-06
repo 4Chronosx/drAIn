@@ -325,9 +325,14 @@ class JobStore:
                 if entry.job.owner == owner and not entry.job.is_finished
             )
             if mine >= self._max_jobs_per_owner:
+                have = (
+                    "a simulation"
+                    if self._max_jobs_per_owner == 1
+                    else f"{self._max_jobs_per_owner} simulations"
+                )
                 raise UserLimitError(
-                    "You already have a simulation queued or running. "
-                    "Wait for it to finish before starting another."
+                    f"You already have {have} queued or running. "
+                    "Wait for one to finish before starting another."
                 )
 
         if self._max_runs_per_owner_per_hour is not None:

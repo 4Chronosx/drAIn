@@ -98,7 +98,7 @@ Not needed for anything above. Its only gain is that Supabase itself stops trust
 > | Vercel env | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | publishable key | Built into the bundle: redeploy after changing it. |
 > | Edge function `geocodeWorker` | auto-injected `SUPABASE_SERVICE_ROLE_KEY` | `JSON.parse(Deno.env.get('SUPABASE_SECRET_KEYS')!)['default']` | Code change and redeploy. Whether the legacy variable is removed or left holding a dead key is unconfirmed; assume it stops working. Confirm `SUPABASE_SECRET_KEYS` exists under Edge Functions > Secrets first. Also check what its caller sends as `Authorization`. |
 > | Frontend repo, `.env.hosted.local` | `SUPABASE_SERVICE_ROLE_KEY` (used by `scripts/scrub-storage-photos.mjs`) | secret key | supabase-js sends the key on both headers by default; same unconfirmed point as `app/runs.py`. |
-> | This repo, your shell | `SUPABASE_KEY` for `scripts/validate_against_reports.py` | secret key | The script sends it on both headers; same point. |
+> | This repo, your shell | `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_KEY`) for `scripts/validate_against_reports.py` | secret key | The script sends it on both headers; same point. |
 > | Any other local `.env` pointing at the hosted project | anon or service-role key | matching new key | |
 >
 > **How a missed one looks.** A dead `SUPABASE_ANON_KEY` on Render does not produce an obvious error: this backend reads Supabase's 401 as "this token is nobody", so every user gets `401` on simulations, as if their sign-in were bad. The logs may also show `Fetching the project's signing keys answered HTTP 401`. A dead service-role key shows as `Could not count recent runs` warnings and no new rows in `simulation_runs`.
