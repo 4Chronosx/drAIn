@@ -184,6 +184,21 @@ class TestPerOwnerLimits:
         finally:
             store.shutdown()
 
+    def test_the_refusal_names_the_limit(self):
+        # The message used to assume one run per person whatever MAX_JOBS_PER_USER said.
+        store = JobStore(
+            max_workers=1, max_queued=4, retention=timedelta(minutes=5), max_jobs_per_owner=2
+        )
+        release = threading.Event()
+        try:
+            store.submit(hang_until(release), owner="a")
+            store.submit(hang_until(release), owner="a")
+            with pytest.raises(UserLimitError, match="already have 2 simulations queued"):
+                store.submit(lambda: {}, owner="a")
+        finally:
+            release.set()
+            store.shutdown()
+
     def test_uncounted_work_is_not_held_to_one_at_a_time(self):
         release = threading.Event()
         store = JobStore(

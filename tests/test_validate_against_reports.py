@@ -19,6 +19,7 @@ from scripts.validate_against_reports import (
     compare_against_volume_baseline,
     compare_distributions,
     fetch_reports,
+    main,
     pooled_auc,
     print_within_barangay,
     reporters_per_component,
@@ -204,3 +205,33 @@ def test_with_no_usable_barangay_there_is_no_pooled_figure(capsys):
     assert pooled_auc(comparisons) is None
     print_within_barangay(comparisons, 5)
     assert "insufficient data" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({"SUPABASE_SERVICE_ROLE_KEY": "the service-role key"}, "the service-role key"),
+        ({"SUPABASE_KEY": "the old name"}, "the old name"),
+        (
+            {"SUPABASE_SERVICE_ROLE_KEY": "the service-role key", "SUPABASE_KEY": "x"},
+            "the service-role key",
+        ),
+    ],
+)
+def test_the_key_is_read_from_the_server_variable_then_the_old_name(monkeypatch, env, expected):
+    # The server reads SUPABASE_SERVICE_ROLE_KEY; the script read only SUPABASE_KEY.
+    seen = []
+
+    def stop_at_the_fetch(url, key):
+        seen.append(key)
+        raise RuntimeError("far enough")
+
+    monkeypatch.setattr("scripts.validate_against_reports.fetch_reports", stop_at_the_fetch)
+    monkeypatch.setenv("SUPABASE_URL", "http://supabase.test")
+    for name in ("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert main([]) == 1
+    assert seen == [expected]

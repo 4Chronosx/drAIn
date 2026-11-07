@@ -30,9 +30,6 @@ RAIN_TIMESERIES_NAME = "TS_Rain"
 #: raining from the original 24-hour series.
 BASE_TIMESERIES_ROWS = 289
 
-DEFAULT_DURATION_HR = 1.0
-DEFAULT_TOTAL_PRECIP_MM = 100.0
-
 #: Fields read from each entry of the ``nodes`` request payload.
 NODE_FIELDS = {
     "inv_elev": "invert_elevation",
@@ -101,8 +98,8 @@ def _build_preconfig(rainfall: Mapping[str, Any]) -> SimulationPreConfig:
     """
     config = SimulationPreConfig()
 
-    duration_hr = float(rainfall.get("duration_hr", DEFAULT_DURATION_HR))
-    total_precip = float(rainfall.get("total_precip", DEFAULT_TOTAL_PRECIP_MM))
+    duration_hr = float(rainfall["duration_hr"])
+    total_precip = float(rainfall["total_precip"])
     series: list[RainfallStep] = generate_rainfall_event(total_precip, duration_hr)
 
     logger.info(
